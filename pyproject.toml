@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xnf4d"
+version = "0.1.0"
+description = "4D normal forms of one-turn maps for non-linear beam dynamics, compatible with xsuite."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "contributors_and_credits.txt"]
+authors = [{ name = "Dora Veres" }]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "contourpy",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+[project.optional-dependencies]
+# one-turn maps from tracking, orbits and distributions of xsuite lines
+xsuite = ["xtrack", "xpart"]
+# the scripts in examples/
+examples = ["xnf4d[xsuite]", "matplotlib"]
+test = ["xnf4d[xsuite]", "pytest"]
+
+[tool.setuptools.packages.find]
+include = ["xnf4d*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
