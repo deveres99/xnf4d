@@ -74,6 +74,8 @@ from collections.abc import Sequence
 from typing import Any, Literal
 
 import numpy as np
+from scipy.special import gamma
+from scipy.integrate import cumulative_trapezoid
 
 from .numerical_normal_form import NormalForm4D, complex_to_real, real_to_complex
 from .polynom import Polynom
@@ -731,32 +733,8 @@ def _pencil_one_jaw(
 
 
 # --------------------------------------------------------------------------- #
-# Distributions defined in normal form coordinates
+# Distributions sampled in normal form coordinates
 # --------------------------------------------------------------------------- #
-
-
-def _check_normal_form(normal_form: NormalForm4D) -> None:
-    """
-    Check that a normal form is computed and non-resonant.
-
-    Parameters
-    ----------
-    normal_form : NormalForm4D
-        Normal form.
-
-    Raises
-    ------
-    ValueError
-        If the normal form is not computed or not non-resonant.
-    """
-    if normal_form.Psi is None:
-        raise ValueError("The normal form has not been computed.")
-    if normal_form.res_case != "nonresonant":
-        raise ValueError(
-            "The distribution is defined by the normal form actions, which are "
-            "invariant only for a non-resonant normal form; got "
-            f"res_case={normal_form.res_case!r}."
-        )
 
 
 def _from_normal_form(
@@ -804,6 +782,300 @@ def _from_normal_form(
             stacklevel=3,
         )
     return np.concatenate(accepted, axis=1)[:, :num_particles]
+
+
+# --------------------------------------------------------------------------- #
+# Checks, longitudinal coordinates and particles
+# --------------------------------------------------------------------------- #
+
+
+def _check_normal_form(normal_form: NormalForm4D) -> None:
+    """
+    Check that a normal form is computed and non-resonant.
+
+    Parameters
+    ----------
+    normal_form : NormalForm4D
+        Normal form.
+
+    Raises
+    ------
+    ValueError
+        If the normal form is not computed or not non-resonant.
+    """
+    if normal_form.Psi is None:
+        raise ValueError("The normal form has not been computed.")
+    if normal_form.res_case != "nonresonant":
+        raise ValueError(
+            "The distribution is defined by the normal form actions, which are "
+            "invariant only for a non-resonant normal form; got "
+            f"res_case={normal_form.res_case!r}."
+        )
+
+
+def _longitudinal_coordinates(
+    line: Any, num_particles: int, sigma_z: float, longitudinal: Any
+) -> tuple[Any, Any]:
+    """
+    Longitudinal coordinates, as in ``xcoll``.
+
+    Parameters
+    ----------
+    line : xtrack.Line
+        Line.
+    num_particles : int
+        Number of particles.
+    sigma_z : float
+        Bunch length [m] for ``longitudinal="bucket"``.
+    longitudinal : None, "bucket", dict or sequence
+        ``None``: ``zeta = delta = 0``; ``"bucket"``: Gaussian bunch matched
+        to the bucket; ``{"zeta": ..., "delta": ...}`` or ``(zeta, delta)``:
+        given coordinates.
+
+    Returns
+    -------
+    zeta, delta : float or numpy.ndarray
+        Longitudinal coordinates.
+
+    Raises
+    ------
+    ValueError
+        If ``longitudinal`` is invalid.
+    NotImplementedError
+        For ``longitudinal="matched_dispersion"`` (as in ``xcoll``).
+    """
+    if longitudinal is None:
+        return 0.0, 0.0
+    if isinstance(longitudinal, str):
+        if longitudinal == "bucket":
+            import xpart as xp
+
+            return xp.generate_longitudinal_coordinates(
+                num_particles=num_particles, distribution="gaussian",
+                sigma_z=sigma_z, line=line,
+            )
+        if longitudinal == "matched_dispersion":
+            raise NotImplementedError("longitudinal='matched_dispersion' is not implemented.")
+        raise ValueError(f"Unknown longitudinal option {longitudinal!r}.")
+    if isinstance(longitudinal, dict):
+        return longitudinal["zeta"], longitudinal["delta"]
+    if hasattr(longitudinal, "__len__") and len(longitudinal) == 2:
+        return longitudinal[0], longitudinal[1]
+    raise ValueError(
+        "longitudinal must be None, 'bucket', a dict with 'zeta' and 'delta' "
+        "or a pair (zeta, delta)."
+    )
+
+
+def _build_particles(
+    line: Any,
+    twiss: Any,
+    name: str,
+    z: np.ndarray,
+    zeta: Any,
+    delta: Any,
+    nemitt_x: float,
+    nemitt_y: float,
+    **kwargs: Any,
+) -> Any:
+    """
+    Particles at an element from normalised coordinates.
+
+    Parameters
+    ----------
+    line : xtrack.Line
+        Line.
+    twiss : xtrack.TwissTable
+        Twiss table of the line.
+    name : str
+        Element at which the particles are built.
+    z : numpy.ndarray, shape (4, N)
+        Normalised coordinates.
+    zeta, delta : float or numpy.ndarray
+        Longitudinal coordinates.
+    nemitt_x, nemitt_y : float
+        Normalised emittances [m].
+    **kwargs
+        Passed to ``line.build_particles``.
+
+    Returns
+    -------
+    xtrack.Particles
+        The particles.
+    """
+    k = list(twiss.name).index(name)
+    part = line.build_particles(
+        x_norm=z[0], px_norm=z[1], y_norm=z[2], py_norm=z[3],
+        zeta=zeta, delta=delta, nemitt_x=nemitt_x, nemitt_y=nemitt_y,
+        at_element=name, W_matrix=twiss.W_matrix[k],
+        particle_on_co=twiss.get_twiss_init(at_element=name).particle_on_co,
+        **kwargs,
+    )
+    if hasattr(part, "_init_random_number_generator"):
+        part._init_random_number_generator()
+    return part
+
+
+# --------------------------------------------------------------------------- #
+# Public interface
+# --------------------------------------------------------------------------- #
+
+
+def generate_pencil_on_collimator(
+    line: Any,
+    name: str,
+    num_particles: int,
+    *,
+    normal_form: NormalForm4D,
+    plane: Literal["x", "y"],
+    jaw: float | Sequence[float],
+    nemitt_x: float | None = None,
+    nemitt_y: float | None = None,
+    side: Literal["+-", "+", "-"] = "+-",
+    pencil_spread: float = 1e-6,
+    impact_parameter: float = 0.0,
+    sigma_z: float = 7.61e-2,
+    twiss: Any = None,
+    longitudinal: Any = None,
+    longitudinal_betatron_cut: Any = None,
+    seed: int | np.random.Generator | None = None,
+    _capacity: int | None = None,
+    **kwargs: Any,
+) -> Any:
+    """
+    Generate a non-linearly matched pencil beam on a collimator.
+
+    Counterpart of ``xcoll.initial_distribution.generate_pencil_on_collimator``
+    in which the pencil follows the invariant curves of the normal form
+    instead of the linear ellipses (see the module documentation). The
+    arguments shared with ``xcoll`` have the same meaning. Differences:
+
+    - the normal form at the collimator, the plane of the collimator and the
+      jaw positions are given explicitly (``xcoll`` reads the last two from
+      the collimator), so ``line`` need not contain ``xcoll`` collimators;
+    - the pencil is always generated at the entrance of the element
+      ``name`` (``xcoll`` uses the exit of diverging jaws);
+    - ``seed`` sets the random generator.
+
+    The normal form must be computed at the element ``name`` with the same
+    emittances, e.g. from a :class:`~xnf4d.one_turn_map.OneTurnMap4D` of a
+    copy of the line cycled to start at ``name``, before collimators are
+    installed (installed but inactive collimators do not change the map)::
+
+        cycled = line.copy()
+        cycled.cycle(name_first_element=name)
+        otm = OneTurnMap4D(cycled, 8, nemitt_x, nemitt_y, sigma_limit=...)
+        otm.compute()
+        nf = otm.calculate_normal_form(7)
+
+    The pencil lies at amplitudes around the jaw, so the map and normal form
+    must be accurate there (``sigma_limit`` above the jaw opening).
+
+    Parameters
+    ----------
+    line : xtrack.Line
+        Line with a built tracker.
+    name : str
+        Element (collimator) at which to generate the pencil.
+    num_particles : int
+        Number of particles.
+    normal_form : NormalForm4D
+        Computed non-resonant normal form of the one-turn map at ``name``,
+        in normalised coordinates with emittances ``nemitt_x, nemitt_y``.
+    plane : {"x", "y"}
+        Plane of the collimator (``"x"`` for a horizontal collimator, angle
+        0 deg in ``xcoll``; ``"y"`` for a vertical one, 90 deg).
+    jaw : float or pair of float
+        Jaw positions [m]: ``(jaw_L, jaw_R)`` (left/positive and right/negative
+        jaw, as ``coll.jaw_L, coll.jaw_R`` in ``xcoll``), or a single value
+        ``a`` for ``(a, -a)``. Use ``None`` for a missing jaw.
+    nemitt_x, nemitt_y : float, optional
+        Normalised emittances [m]; by default those of the collimator
+        ``line[name]`` (``xcoll`` collimators with assigned optics).
+    side : {"+-", "+", "-"}, default "+-"
+        Jaw(s) on which to generate the pencil: left (``"+"``), right
+        (``"-"``) or both, half of the particles on each.
+    pencil_spread : float, default 1e-6
+        Maximum penetration of the orbits beyond the impact position [m].
+    impact_parameter : float, default 0
+        Distance beyond the jaw [m] from which the pencil starts.
+    sigma_z : float, default 7.61e-2
+        Bunch length [m] for ``longitudinal="bucket"``.
+    twiss : xtrack.TwissTable, optional
+        Twiss table of the line (6D), computed if not given.
+    longitudinal : None, "bucket", dict or pair, optional
+        Longitudinal coordinates as in ``xcoll``: ``None`` (zero),
+        ``"bucket"`` (Gaussian bunch in the bucket), ``{"zeta": ...,
+        "delta": ...}`` or ``(zeta, delta)``. The pencil is defined for the
+        betatron coordinates (``delta = 0``), as in ``xpart``.
+    longitudinal_betatron_cut : optional
+        Accepted for compatibility with ``xcoll``, not used (as in
+        ``xcoll``).
+    seed : int or numpy.random.Generator, optional
+        Seed of the random generator.
+    _capacity : int, optional
+        Capacity of the particles object.
+    **kwargs
+        Passed to ``line.build_particles``.
+
+    Returns
+    -------
+    xtrack.Particles
+        The particles at the element ``name``, those of the left jaw first.
+
+    Raises
+    ------
+    ValueError
+        If the arguments are invalid, the normal form is not computed or not
+        non-resonant, or a jaw is on the wrong side of the closed orbit.
+    """
+    del longitudinal_betatron_cut  # unused, as in xcoll
+    if not line._has_valid_tracker():
+        raise ValueError("Please build tracker before generating pencil distribution!")
+    _check_normal_form(normal_form)
+    if plane not in ("x", "y"):
+        raise ValueError(f"plane must be 'x' or 'y', got {plane!r}.")
+    if side not in ("+-", "+", "-"):
+        raise ValueError(f"side must be '+-', '+' or '-', got {side!r}.")
+    if pencil_spread <= 0:
+        raise ValueError(f"pencil_spread must be positive, got {pencil_spread}.")
+    num_particles = int(num_particles)
+    if num_particles < 1:
+        raise ValueError(f"num_particles must be positive, got {num_particles}.")
+    if nemitt_x is None or nemitt_y is None:
+        element = line[name]
+        if getattr(element, "optics", None) is None:
+            raise ValueError(
+                "nemitt_x and nemitt_y must be given (the element has no assigned optics)."
+            )
+        nemitt_x = element.nemitt_x if nemitt_x is None else nemitt_x
+        nemitt_y = element.nemitt_y if nemitt_y is None else nemitt_y
+    jaw_L, jaw_R = (jaw, -jaw) if np.ndim(jaw) == 0 else tuple(jaw)
+    if twiss is None:
+        twiss = line.twiss()
+
+    sides = ("+", "-") if side == "+-" else (side,)
+    counts = (
+        [num_particles // 2, num_particles - num_particles // 2]
+        if side == "+-" else [num_particles]
+    )
+    rng = np.random.default_rng(seed)
+    zeta, delta = _longitudinal_coordinates(line, num_particles, sigma_z, longitudinal)
+
+    transforms = _Transforms(normal_form, plane)
+    parts = []
+    for s, count in zip(sides, counts):
+        if count == 0:
+            continue
+        jaw_pos = jaw_L if s == "+" else jaw_R
+        if jaw_pos is None:
+            raise ValueError(f"No jaw position given for side {s!r}.")
+        pos = jaw_pos + impact_parameter if s == "+" else jaw_pos - impact_parameter
+        geometry = _Geometry(twiss, name, plane, s, pos, nemitt_x, nemitt_y)
+        parts.append(_pencil_one_jaw(transforms, geometry, count, pencil_spread, rng))
+    z = np.concatenate(parts, axis=1)
+    return _build_particles(line, twiss, name, z, zeta, delta, nemitt_x, nemitt_y,
+                            _capacity=_capacity, **kwargs)
 
 
 def generate_2D_uniform_circular_sector(
@@ -994,273 +1266,3 @@ def generate_matched_gaussian_bunch(
     part = _build_particles(line, twiss, at_element, z, zeta, delta, nemitt_x, nemitt_y,
                             weight=total_intensity_particles / num_particles, **kwargs)
     return (part, matcher) if return_matcher else part
-
-
-def _build_particles(
-    line: Any,
-    twiss: Any,
-    name: str,
-    z: np.ndarray,
-    zeta: Any,
-    delta: Any,
-    nemitt_x: float,
-    nemitt_y: float,
-    **kwargs: Any,
-) -> Any:
-    """
-    Particles at an element from normalised coordinates.
-
-    Parameters
-    ----------
-    line : xtrack.Line
-        Line.
-    twiss : xtrack.TwissTable
-        Twiss table of the line.
-    name : str
-        Element at which the particles are built.
-    z : numpy.ndarray, shape (4, N)
-        Normalised coordinates.
-    zeta, delta : float or numpy.ndarray
-        Longitudinal coordinates.
-    nemitt_x, nemitt_y : float
-        Normalised emittances [m].
-    **kwargs
-        Passed to ``line.build_particles``.
-
-    Returns
-    -------
-    xtrack.Particles
-        The particles.
-    """
-    k = list(twiss.name).index(name)
-    part = line.build_particles(
-        x_norm=z[0], px_norm=z[1], y_norm=z[2], py_norm=z[3],
-        zeta=zeta, delta=delta, nemitt_x=nemitt_x, nemitt_y=nemitt_y,
-        at_element=name, W_matrix=twiss.W_matrix[k],
-        particle_on_co=twiss.get_twiss_init(at_element=name).particle_on_co,
-        **kwargs,
-    )
-    if hasattr(part, "_init_random_number_generator"):
-        part._init_random_number_generator()
-    return part
-
-
-# --------------------------------------------------------------------------- #
-# Longitudinal coordinates
-# --------------------------------------------------------------------------- #
-
-
-def _longitudinal_coordinates(
-    line: Any, num_particles: int, sigma_z: float, longitudinal: Any
-) -> tuple[Any, Any]:
-    """
-    Longitudinal coordinates, as in ``xcoll``.
-
-    Parameters
-    ----------
-    line : xtrack.Line
-        Line.
-    num_particles : int
-        Number of particles.
-    sigma_z : float
-        Bunch length [m] for ``longitudinal="bucket"``.
-    longitudinal : None, "bucket", dict or sequence
-        ``None``: ``zeta = delta = 0``; ``"bucket"``: Gaussian bunch matched
-        to the bucket; ``{"zeta": ..., "delta": ...}`` or ``(zeta, delta)``:
-        given coordinates.
-
-    Returns
-    -------
-    zeta, delta : float or numpy.ndarray
-        Longitudinal coordinates.
-
-    Raises
-    ------
-    ValueError
-        If ``longitudinal`` is invalid.
-    NotImplementedError
-        For ``longitudinal="matched_dispersion"`` (as in ``xcoll``).
-    """
-    if longitudinal is None:
-        return 0.0, 0.0
-    if isinstance(longitudinal, str):
-        if longitudinal == "bucket":
-            import xpart as xp
-
-            return xp.generate_longitudinal_coordinates(
-                num_particles=num_particles, distribution="gaussian",
-                sigma_z=sigma_z, line=line,
-            )
-        if longitudinal == "matched_dispersion":
-            raise NotImplementedError("longitudinal='matched_dispersion' is not implemented.")
-        raise ValueError(f"Unknown longitudinal option {longitudinal!r}.")
-    if isinstance(longitudinal, dict):
-        return longitudinal["zeta"], longitudinal["delta"]
-    if hasattr(longitudinal, "__len__") and len(longitudinal) == 2:
-        return longitudinal[0], longitudinal[1]
-    raise ValueError(
-        "longitudinal must be None, 'bucket', a dict with 'zeta' and 'delta' "
-        "or a pair (zeta, delta)."
-    )
-
-
-# --------------------------------------------------------------------------- #
-# Public interface
-# --------------------------------------------------------------------------- #
-
-
-def generate_pencil_on_collimator(
-    line: Any,
-    name: str,
-    num_particles: int,
-    *,
-    normal_form: NormalForm4D,
-    plane: Literal["x", "y"],
-    jaw: float | Sequence[float],
-    nemitt_x: float | None = None,
-    nemitt_y: float | None = None,
-    side: Literal["+-", "+", "-"] = "+-",
-    pencil_spread: float = 1e-6,
-    impact_parameter: float = 0.0,
-    sigma_z: float = 7.61e-2,
-    twiss: Any = None,
-    longitudinal: Any = None,
-    longitudinal_betatron_cut: Any = None,
-    seed: int | np.random.Generator | None = None,
-    _capacity: int | None = None,
-    **kwargs: Any,
-) -> Any:
-    """
-    Generate a non-linearly matched pencil beam on a collimator.
-
-    Counterpart of ``xcoll.initial_distribution.generate_pencil_on_collimator``
-    in which the pencil follows the invariant curves of the normal form
-    instead of the linear ellipses (see the module documentation). The
-    arguments shared with ``xcoll`` have the same meaning. Differences:
-
-    - the normal form at the collimator, the plane of the collimator and the
-      jaw positions are given explicitly (``xcoll`` reads the last two from
-      the collimator), so ``line`` need not contain ``xcoll`` collimators;
-    - the pencil is always generated at the entrance of the element
-      ``name`` (``xcoll`` uses the exit of diverging jaws);
-    - ``seed`` sets the random generator.
-
-    The normal form must be computed at the element ``name`` with the same
-    emittances, e.g. from a :class:`~xnf4d.one_turn_map.OneTurnMap4D` of a
-    copy of the line cycled to start at ``name``, before collimators are
-    installed (installed but inactive collimators do not change the map)::
-
-        cycled = line.copy()
-        cycled.cycle(name_first_element=name)
-        otm = OneTurnMap4D(cycled, 8, nemitt_x, nemitt_y, sigma_limit=...)
-        otm.compute()
-        nf = otm.calculate_normal_form(7)
-
-    The pencil lies at amplitudes around the jaw, so the map and normal form
-    must be accurate there (``sigma_limit`` above the jaw opening).
-
-    Parameters
-    ----------
-    line : xtrack.Line
-        Line with a built tracker.
-    name : str
-        Element (collimator) at which to generate the pencil.
-    num_particles : int
-        Number of particles.
-    normal_form : NormalForm4D
-        Computed non-resonant normal form of the one-turn map at ``name``,
-        in normalised coordinates with emittances ``nemitt_x, nemitt_y``.
-    plane : {"x", "y"}
-        Plane of the collimator (``"x"`` for a horizontal collimator, angle
-        0 deg in ``xcoll``; ``"y"`` for a vertical one, 90 deg).
-    jaw : float or pair of float
-        Jaw positions [m]: ``(jaw_L, jaw_R)`` (left/positive and right/negative
-        jaw, as ``coll.jaw_L, coll.jaw_R`` in ``xcoll``), or a single value
-        ``a`` for ``(a, -a)``. Use ``None`` for a missing jaw.
-    nemitt_x, nemitt_y : float, optional
-        Normalised emittances [m]; by default those of the collimator
-        ``line[name]`` (``xcoll`` collimators with assigned optics).
-    side : {"+-", "+", "-"}, default "+-"
-        Jaw(s) on which to generate the pencil: left (``"+"``), right
-        (``"-"``) or both, half of the particles on each.
-    pencil_spread : float, default 1e-6
-        Maximum penetration of the orbits beyond the impact position [m].
-    impact_parameter : float, default 0
-        Distance beyond the jaw [m] from which the pencil starts.
-    sigma_z : float, default 7.61e-2
-        Bunch length [m] for ``longitudinal="bucket"``.
-    twiss : xtrack.TwissTable, optional
-        Twiss table of the line (6D), computed if not given.
-    longitudinal : None, "bucket", dict or pair, optional
-        Longitudinal coordinates as in ``xcoll``: ``None`` (zero),
-        ``"bucket"`` (Gaussian bunch in the bucket), ``{"zeta": ...,
-        "delta": ...}`` or ``(zeta, delta)``. The pencil is defined for the
-        betatron coordinates (``delta = 0``), as in ``xpart``.
-    longitudinal_betatron_cut : optional
-        Accepted for compatibility with ``xcoll``, not used (as in
-        ``xcoll``).
-    seed : int or numpy.random.Generator, optional
-        Seed of the random generator.
-    _capacity : int, optional
-        Capacity of the particles object.
-    **kwargs
-        Passed to ``line.build_particles``.
-
-    Returns
-    -------
-    xtrack.Particles
-        The particles at the element ``name``, those of the left jaw first.
-
-    Raises
-    ------
-    ValueError
-        If the arguments are invalid, the normal form is not computed or not
-        non-resonant, or a jaw is on the wrong side of the closed orbit.
-    """
-    del longitudinal_betatron_cut  # unused, as in xcoll
-    if not line._has_valid_tracker():
-        raise ValueError("Please build tracker before generating pencil distribution!")
-    _check_normal_form(normal_form)
-    if plane not in ("x", "y"):
-        raise ValueError(f"plane must be 'x' or 'y', got {plane!r}.")
-    if side not in ("+-", "+", "-"):
-        raise ValueError(f"side must be '+-', '+' or '-', got {side!r}.")
-    if pencil_spread <= 0:
-        raise ValueError(f"pencil_spread must be positive, got {pencil_spread}.")
-    num_particles = int(num_particles)
-    if num_particles < 1:
-        raise ValueError(f"num_particles must be positive, got {num_particles}.")
-    if nemitt_x is None or nemitt_y is None:
-        element = line[name]
-        if getattr(element, "optics", None) is None:
-            raise ValueError(
-                "nemitt_x and nemitt_y must be given (the element has no assigned optics)."
-            )
-        nemitt_x = element.nemitt_x if nemitt_x is None else nemitt_x
-        nemitt_y = element.nemitt_y if nemitt_y is None else nemitt_y
-    jaw_L, jaw_R = (jaw, -jaw) if np.ndim(jaw) == 0 else tuple(jaw)
-    if twiss is None:
-        twiss = line.twiss()
-
-    sides = ("+", "-") if side == "+-" else (side,)
-    counts = (
-        [num_particles // 2, num_particles - num_particles // 2]
-        if side == "+-" else [num_particles]
-    )
-    rng = np.random.default_rng(seed)
-    zeta, delta = _longitudinal_coordinates(line, num_particles, sigma_z, longitudinal)
-
-    transforms = _Transforms(normal_form, plane)
-    parts = []
-    for s, count in zip(sides, counts):
-        if count == 0:
-            continue
-        jaw_pos = jaw_L if s == "+" else jaw_R
-        if jaw_pos is None:
-            raise ValueError(f"No jaw position given for side {s!r}.")
-        pos = jaw_pos + impact_parameter if s == "+" else jaw_pos - impact_parameter
-        geometry = _Geometry(twiss, name, plane, s, pos, nemitt_x, nemitt_y)
-        parts.append(_pencil_one_jaw(transforms, geometry, count, pencil_spread, rng))
-    z = np.concatenate(parts, axis=1)
-    return _build_particles(line, twiss, name, z, zeta, delta, nemitt_x, nemitt_y,
-                            _capacity=_capacity, **kwargs)
