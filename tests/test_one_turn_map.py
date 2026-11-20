@@ -379,7 +379,10 @@ class TestLHC:
 
     def test_sample(self, lhc_map):
         n_mono = comb(8, 4) - 1
-        assert lhc_map.z0.shape == lhc_map.z1.shape == (4, max(1000, 10 * n_mono))
+        n = max(1000, 10 * n_mono)
+        # midplane_symmetry="auto": the mirrored particles follow the sample
+        assert lhc_map.z0.shape == lhc_map.z1.shape == (4, 2 * n)
+        np.testing.assert_allclose(lhc_map.z0[:, n:], MIRROR * lhc_map.z0[:, :n], atol=1e-9)
         Jx = (lhc_map.z0[0] ** 2 + lhc_map.z0[1] ** 2) / 2
         assert Jx.max() <= lhc_map.sigma_limit**2 / 2 + 1e-9
 
@@ -584,3 +587,128 @@ class TestIslands:
         assert np.all(np.isfinite(island["mapped"]))
         amp = np.hypot(island["mapped"][:, 0], island["mapped"][:, 1])
         assert amp.max() < island["otm"].sigma_limit
+
+
+# --------------------------------------------------------------------------- #
+# Midplane symmetry
+# --------------------------------------------------------------------------- #
+
+MIRROR = np.array([1.0, 1.0, -1.0, -1.0])[:, None]
+
+
+def skew_kick_then_rotate(z: np.ndarray) -> np.ndarray:
+    """Normal plus skew sextupole kick, from V + a (x^2 y - y^3 / 3): not midplane symmetric."""
+    x, px, y, py = z
+    a = 0.3 * K2
+    px = px - (K2 * (x**2 - y**2) + 2 * a * x * y)
+    py = py - (-2 * K2 * x * y + a * (x**2 - y**2))
+    return rotation() @ np.array([x, px, y, py])
+
+
+class TestMidplaneSymmetry:
+    def test_model_keeps_even_generators(self):
+        full = _LieMapModel(rotation(), 5)
+        sym = _LieMapModel(rotation(), 5, midplane_symmetric=True)
+        assert sym.n_params < full.n_params
+        for k in sym.degrees:
+            e = sym.gen_exps[k]
+            assert np.all((e[:, 2] + e[:, 3]) % 2 == 0)
+            # all even monomials are kept
+            ef = full.gen_exps[k]
+            assert len(e) == np.sum((ef[:, 2] + ef[:, 3]) % 2 == 0)
+        assert sym.n_mono == full.n_mono
+
+    def test_symmetric_map_commutes_with_mirror(self, rng):
+        model = _LieMapModel(rotation(), 5, midplane_symmetric=True)
+        C = model.coefficients(rng.normal(size=model.n_params) * 0.1)
+        z = rng.normal(size=(4, 50)) * 0.5
+        V, Vm = _monomial_values(z, model.exps), _monomial_values(MIRROR * z, model.exps)
+        np.testing.assert_allclose((Vm @ C).T, MIRROR * (V @ C).T, atol=1e-14)
+
+    def test_from_data_symmetric_fit_of_symmetric_map(self, rng):
+        z0 = sample(rng, 800)
+        maps = {}
+        for opt in (False, True):
+            otm = OneTurnMap4D.from_data(z0, kick_then_rotate(z0), rotation(), 4,
+                                         midplane_symmetry=opt)
+            otm.compute()
+            assert otm.midplane_symmetric is opt
+            maps[opt] = otm
+        z = sample(rng, 50, 0.8)
+        np.testing.assert_allclose(maps[True].track_map(z), maps[False].track_map(z), atol=1e-10)
+        # a pure horizontal orbit stays in the horizontal plane exactly
+        z[2:] = 0
+        assert np.all(maps[True].track_map(z, 5)[2:] == 0)
+
+    def test_symmetric_fit_cannot_follow_asymmetric_map(self, rng):
+        z0 = sample(rng, 800)
+        fits = {}
+        for opt in (False, True):
+            otm = OneTurnMap4D.from_data(z0, skew_kick_then_rotate(z0), rotation(), 3,
+                                         midplane_symmetry=opt)
+            otm.compute()
+            fits[opt] = otm.fit_rms.max()
+        assert fits[False] < 1e-10 < 1e-3 < fits[True]
+
+    @pytest.mark.parametrize("value", ["auto", "yes", 1, None])
+    def test_from_data_invalid_option(self, value):
+        z = sample(np.random.default_rng(0), 200)
+        with pytest.raises(ValueError, match="midplane_symmetry"):
+            OneTurnMap4D.from_data(z, z, rotation(), 3, midplane_symmetry=value)
+
+    def test_coupled_linear_map_rejected(self):
+        z = sample(np.random.default_rng(0), 200)
+        R = rotation()
+        R[0, 2] = 1e-3
+        with pytest.raises(ValueError, match="couple"):
+            OneTurnMap4D.from_data(z, z, R, 3, midplane_symmetry=True)
+        OneTurnMap4D.from_data(z, z, R, 3)  # fine without the symmetry
+
+
+def small_line(ksl2: float = 0.0):
+    """Linear map and an octupole, plus an optional skew sextupole."""
+    xt = pytest.importorskip("xtrack")
+    line = xt.Line(
+        elements=[
+            xt.LineSegmentMap(length=100.0, betx=100.0, bety=80.0, qx=QX - 0.03, qy=QY,
+                              longitudinal_mode="linear_fixed_qs", qs=0.004, bets=500.0),
+            xt.Multipole(knl=[0, 0, 0, 300.0], ksl=[0, 0, ksl2, 0]),
+        ],
+        element_names=["start", "mult"],
+    )
+    line.set_particle_ref("proton", p0c=450e9)
+    line.build_tracker()
+    return line
+
+
+class TestMidplaneSymmetryLine:
+    def test_auto_imposes_on_symmetric_line(self):
+        otm = OneTurnMap4D(small_line(), 5, 2.5e-6, 2.5e-6, 6, seed=1)
+        assert otm.midplane_symmetry == "auto"
+        assert otm.midplane_asymmetry < 1e-12
+        # the mirrored particles double the data
+        assert otm.z0.shape[1] == 2 * max(1000, 10 * otm._model.n_mono)
+        otm.compute()
+        assert otm.midplane_symmetric is True
+        z = np.array([[3.0, 1.0], [0.5, -2.0], [0.0, 0.0], [0.0, 0.0]])
+        assert np.all(otm.track_map(z)[2:] == 0)
+
+    def test_auto_rejects_skew_line(self):
+        otm = OneTurnMap4D(small_line(ksl2=20.0), 5, 2.5e-6, 2.5e-6, 6, seed=1)
+        assert otm.midplane_asymmetry > 1e-6
+        otm.compute()
+        assert otm.midplane_symmetric is False
+        z, _ = otm.track(sample(np.random.default_rng(1), 50, 4.0))
+        assert otm.fit_rms.max() < 1e-6
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_explicit_option_does_not_track_mirror(self, value):
+        otm = OneTurnMap4D(small_line(), 3, 2.5e-6, 2.5e-6, 6, seed=1, num_particles=1500,
+                           midplane_symmetry=value)
+        assert otm.midplane_asymmetry is None and otm.z0.shape[1] == 1500
+        otm.compute()
+        assert otm.midplane_symmetric is value
+
+    def test_invalid_option(self):
+        with pytest.raises(ValueError, match="midplane_symmetry"):
+            OneTurnMap4D(small_line(), 3, 2.5e-6, 2.5e-6, 6, midplane_symmetry="maybe")

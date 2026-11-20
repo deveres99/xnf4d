@@ -24,6 +24,14 @@ The fit uses two observations:
   coefficients. The map and its exact Jacobian with respect to the
   generator coefficients follow from a few matrix products.
 
+Midplane symmetry: if the line is symmetric under the reflection
+``S: (x, px, y, py) -> (x, px, -y, -py)`` (no skew elements, no vertical
+orbit through non-linear elements), the one-turn map commutes with ``S``.
+This holds for the Lie map exactly when every generator is even in
+``(y, py)``, so the symmetry can be imposed by dropping the other generator
+terms. :class:`OneTurnMap4D` measures the asymmetry by tracking and imposes
+the symmetry only when the asymmetry is within the accuracy of the fit.
+
 Convention for the Lie operators: ``:f: g = {f, g}`` with
 ``{f, g} = sum_(q, p) (df/dq dg/dp - df/dp dg/dq)`` over the pairs
 ``(x, px)`` and ``(y, py)``, and ``exp(:f:) g = sum_k :f:^k g / k!``.
@@ -46,6 +54,8 @@ __all__ = ["OneTurnMap4D"]
 
 #: Canonical pairs (q, p) of the variables (x, px, y, py).
 _PAIRS = ((0, 1), (2, 3))
+#: Midplane reflection S: (x, px, y, py) -> (x, px, -y, -py), as a column.
+_MIRROR = np.array([1.0, 1.0, -1.0, -1.0])[:, None]
 
 
 # --------------------------------------------------------------------------- #
@@ -121,12 +131,19 @@ class _LieMapModel:
     max_order : int
         Truncation order ``n`` of the map. Generators have degrees 3 to
         ``n + 1``.
+    midplane_symmetric : bool, default False
+        Keep only the generator monomials even in ``(y, py)``, so that the
+        map commutes with the midplane reflection (``linear_map`` must
+        commute with it as well).
     """
 
-    def __init__(self, linear_map: np.ndarray, max_order: int) -> None:
+    def __init__(
+        self, linear_map: np.ndarray, max_order: int, midplane_symmetric: bool = False
+    ) -> None:
         if max_order < 2:
             raise ValueError(f"max_map_order must be at least 2, got {max_order}.")
         self.max_order = max_order
+        self.midplane_symmetric = bool(midplane_symmetric)
         #: Exponents of the map monomials (orders 1 to n).
         self.exps = _monomials(1, max_order)
         self.n_mono = len(self.exps)
@@ -134,6 +151,10 @@ class _LieMapModel:
         self.degrees = list(range(3, max_order + 2))
         #: Exponents of the generator monomials, per degree.
         self.gen_exps = {k: _monomials(k, k) for k in self.degrees}
+        if self.midplane_symmetric:
+            self.gen_exps = {
+                k: e[(e[:, 2] + e[:, 3]) % 2 == 0] for k, e in self.gen_exps.items()
+            }
         sizes = [len(self.gen_exps[k]) for k in self.degrees]
         #: Slices of the parameter vector belonging to each degree.
         self.slices = {}
@@ -448,6 +469,27 @@ def _symplectic_rotation(R: np.ndarray, tol: float = 1e-6) -> np.ndarray:
     return out
 
 
+def _check_symmetry_option(value: Any, allow_auto: bool) -> None:
+    """
+    Check a ``midplane_symmetry`` argument.
+
+    Parameters
+    ----------
+    value : any
+        The argument.
+    allow_auto : bool
+        Whether ``"auto"`` is allowed.
+
+    Raises
+    ------
+    ValueError
+        If the value is not allowed.
+    """
+    allowed = (True, False, "auto") if allow_auto else (True, False)
+    if not any(value is a or (isinstance(a, str) and value == a) for a in allowed):
+        raise ValueError(f"midplane_symmetry must be one of {allowed}, got {value!r}.")
+
+
 # --------------------------------------------------------------------------- #
 # One-turn map
 # --------------------------------------------------------------------------- #
@@ -495,6 +537,16 @@ class OneTurnMap4D:
         Seed of the random generator used to sample the particles.
     twiss_kwargs : dict, optional
         Additional arguments passed to ``line.twiss``.
+    midplane_symmetry : bool or "auto", default "auto"
+        Impose the midplane symmetry of the map (see the module
+        documentation). With ``"auto"`` the mirror images ``S z`` of the
+        particles are tracked as well (doubling the fit data) and the
+        asymmetry ``(F(z) - S F(S z)) / 2`` is measured; :meth:`compute` keeps
+        the symmetric fit if the RMS asymmetry is no larger than the RMS
+        error of that fit on the symmetric part of the data (imposing the
+        symmetry then adds no error beyond that of the fit), and otherwise
+        fits without the constraint. With True the symmetry is imposed
+        without test, with False never.
 
     Notes
     -----
@@ -524,7 +576,16 @@ class OneTurnMap4D:
         phase advances of the twiss, kept fixed in the fit.
     z0, z1 : numpy.ndarray, shape (4, N)
         Normalised coordinates of the surviving particles before and after
-        one turn.
+        one turn (with ``midplane_symmetry="auto"``, followed by those of
+        the mirrored particles).
+    midplane_symmetry : bool or "auto"
+        Requested treatment of the midplane symmetry.
+    midplane_asymmetry : float or None
+        RMS of the asymmetry ``(F(z) - S F(S z)) / 2`` over the tracked pairs
+        [beam sizes] (``"auto"`` only).
+    midplane_symmetric : bool or None
+        Whether the fitted map is midplane symmetric (set by
+        :meth:`compute`).
     """
 
     def __init__(
@@ -538,9 +599,11 @@ class OneTurnMap4D:
         method: Literal["6d", "4d"] = "6d",
         seed: int | np.random.Generator | None = None,
         twiss_kwargs: dict[str, Any] | None = None,
+        midplane_symmetry: bool | Literal["auto"] = "auto",
     ) -> None:
         if method not in ("6d", "4d"):
             raise ValueError(f"method must be '6d' or '4d', got {method!r}.")
+        _check_symmetry_option(midplane_symmetry, allow_auto=True)
         if sigma_limit <= 0:
             raise ValueError(f"sigma_limit must be positive, got {sigma_limit}.")
         self.line = line
@@ -556,15 +619,22 @@ class OneTurnMap4D:
         self.twiss = line.twiss(method=method, **(twiss_kwargs or {}))
         W = self.twiss.W_matrix[0]
         R = np.linalg.inv(W) @ self.twiss.R_matrix @ W
-        self._setup(_symplectic_rotation(R[:4, :4]), max_map_order)
+        self._setup(_symplectic_rotation(R[:4, :4]), max_map_order, midplane_symmetry)
 
         if num_particles is None:
             num_particles = max(1000, 10 * self._model.n_mono)
         rng = np.random.default_rng(seed)
         z0 = self._sample(rng, int(num_particles))
         self.z0, self.z1 = self._track(z0)
+        if midplane_symmetry == "auto":
+            self._track_mirrored()
 
-    def _setup(self, linear_map: np.ndarray, max_map_order: int) -> None:
+    def _setup(
+        self,
+        linear_map: np.ndarray,
+        max_map_order: int,
+        midplane_symmetry: bool | Literal["auto"] = False,
+    ) -> None:
         """
         Initialise the fit model and the result attributes.
 
@@ -574,22 +644,55 @@ class OneTurnMap4D:
             Linear one-turn map in normalised coordinates.
         max_map_order : int
             Order of the polynomial map.
+        midplane_symmetry : bool or "auto", default False
+            Requested treatment of the midplane symmetry.
 
         Raises
         ------
         ValueError
-            If ``max_map_order`` is below 2.
+            If ``max_map_order`` is below 2, or the symmetry is requested
+            and ``linear_map`` couples the planes.
         """
         self.max_map_order = int(max_map_order)
         if self.max_map_order < 2:
             raise ValueError(f"max_map_order must be at least 2, got {max_map_order}.")
         self.R: np.ndarray = np.array(linear_map, dtype=float)
-        self._model = _LieMapModel(self.R, self.max_map_order)
+        if midplane_symmetry is not False and (
+            np.any(self.R[:2, 2:] != 0) or np.any(self.R[2:, :2] != 0)
+        ):
+            raise ValueError(
+                "The midplane symmetry requires a linear map that does not couple "
+                "the planes."
+            )
+        self.midplane_symmetry = midplane_symmetry
+        self.midplane_asymmetry: float | None = None
+        self.midplane_symmetric: bool | None = None
+        self._n_pairs = 0
+        self._models: dict[bool, _LieMapModel] = {}
+        self._model = self._model_for(midplane_symmetry is True)
         self.one_turn_map: Map | None = None
         self.generators: list[Polynom] | None = None
         self.fit_result: OptimizeResult | None = None
         self.fit_rms: np.ndarray | None = None
         self.normal_form: NormalForm4D | None = None
+
+    def _model_for(self, symmetric: bool) -> _LieMapModel:
+        """
+        Fit model with or without the midplane symmetry (built once).
+
+        Parameters
+        ----------
+        symmetric : bool
+            Midplane symmetric model.
+
+        Returns
+        -------
+        _LieMapModel
+            The model.
+        """
+        if symmetric not in self._models:
+            self._models[symmetric] = _LieMapModel(self.R, self.max_map_order, symmetric)
+        return self._models[symmetric]
 
     @classmethod
     def from_data(
@@ -599,6 +702,7 @@ class OneTurnMap4D:
         linear_map: np.ndarray,
         max_map_order: int,
         sigma_limit: float | None = None,
+        midplane_symmetry: bool = False,
     ) -> OneTurnMap4D:
         """
         One-turn map fitted to given tracking data.
@@ -619,6 +723,9 @@ class OneTurnMap4D:
         sigma_limit : float, optional
             Amplitude scale used to condition the fit. By default the largest
             amplitude of ``z0``.
+        midplane_symmetry : bool, default False
+            Impose the midplane symmetry of the map (``"auto"`` is not
+            available, as it needs tracking).
 
         Returns
         -------
@@ -628,8 +735,10 @@ class OneTurnMap4D:
         Raises
         ------
         ValueError
-            If the data have the wrong shape or are too few.
+            If the data have the wrong shape or are too few, or the symmetry
+            is requested with a linear map coupling the planes.
         """
+        _check_symmetry_option(midplane_symmetry, allow_auto=False)
         z0 = np.asarray(z0, dtype=float)
         z1 = np.asarray(z1, dtype=float)
         if z0.ndim != 2 or z0.shape[0] != 4 or z0.shape != z1.shape:
@@ -641,7 +750,7 @@ class OneTurnMap4D:
         obj.twiss = None
         obj.method = None
         obj.nemitt_x = obj.nemitt_y = None
-        obj._setup(linear_map, max_map_order)
+        obj._setup(linear_map, max_map_order, midplane_symmetry)
         if z0.shape[1] < 2 * obj._model.n_mono:
             raise ValueError(
                 f"{z0.shape[1]} samples are too few to fit "
@@ -805,6 +914,53 @@ class OneTurnMap4D:
             )
         return z0[:, alive], z1[:, alive]
 
+    def _track_mirrored(self) -> None:
+        """
+        Track the mirror images of the fit sample and measure the asymmetry.
+
+        Appends the surviving pairs' mirrored particles to :attr:`z0` and
+        :attr:`z1` (the first ``_n_pairs`` columns are their partners) and
+        sets :attr:`midplane_asymmetry`.
+        """
+        n = self.z0.shape[1]
+        z0m = self.normalised_coordinates(self.build_particles(_MIRROR * self.z0))
+        z1m, alive = self.track(z0m)
+        n_lost = int(np.sum(~alive))
+        if n_lost:
+            warnings.warn(
+                f"{n_lost} of {n} mirrored particles were lost during the turn; "
+                "they and their partners are excluded from the symmetry test.",
+                stacklevel=3,
+            )
+        keep = np.flatnonzero(alive)
+        # partners first, so that pair k is (column k, column n_pairs + k)
+        others = np.setdiff1d(np.arange(n), keep)
+        self.z0 = np.concatenate([self.z0[:, keep], z0m[:, keep], self.z0[:, others]], axis=1)
+        self.z1 = np.concatenate([self.z1[:, keep], z1m[:, keep], self.z1[:, others]], axis=1)
+        self._n_pairs = keep.size
+        asym = self._pair_parts(self.z1)[1]
+        # without pairs the symmetry is untested: never impose it
+        self.midplane_asymmetry = float(np.sqrt(np.mean(asym**2))) if keep.size else np.inf
+
+    def _pair_parts(self, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Symmetric and antisymmetric parts of values at the mirrored pairs.
+
+        Parameters
+        ----------
+        values : numpy.ndarray, shape (4, N)
+            Values at the columns of :attr:`z0` (e.g. :attr:`z1` or fit
+            residuals).
+
+        Returns
+        -------
+        sym, asym : numpy.ndarray, shape (4, n_pairs)
+            ``(v(z) + S v(S z)) / 2`` and ``(v(z) - S v(S z)) / 2``.
+        """
+        k = self._n_pairs
+        a, b = values[:, :k], _MIRROR * values[:, k : 2 * k]
+        return (a + b) / 2, (a - b) / 2
+
     # ------------------------------------------------------------------ #
     # Fit
     # ------------------------------------------------------------------ #
@@ -840,8 +996,12 @@ class OneTurnMap4D:
         """
         Fit the one-turn map.
 
-        Sets :attr:`one_turn_map`, :attr:`generators`, :attr:`fit_result`
-        and :attr:`fit_rms`.
+        Sets :attr:`one_turn_map`, :attr:`generators`, :attr:`fit_result`,
+        :attr:`fit_rms` and :attr:`midplane_symmetric`. With
+        ``midplane_symmetry="auto"`` the symmetric map is fitted first and
+        kept if the measured asymmetry is within its accuracy (see the class
+        documentation); otherwise the map is fitted again without the
+        constraint.
 
         Parameters
         ----------
@@ -851,7 +1011,46 @@ class OneTurnMap4D:
             Further arguments for :func:`scipy.optimize.least_squares`
             (defaults: ``method="lm"``, ``x_scale="jac"``).
         """
-        model = self._model
+        symmetric = self.midplane_symmetry is not False
+        result = self._fit(self._model_for(symmetric), verbose, least_squares_kwargs)
+        if self.midplane_symmetry == "auto":
+            model = self._model_for(True)
+            pred = model.coefficients(result.x)
+            residual = _monomial_values(self.z0, model.exps) @ pred - self.z1.T
+            sym = self._pair_parts(residual.T)[0]
+            if self.midplane_asymmetry > np.sqrt(np.mean(sym**2)):
+                symmetric = False
+                result = self._fit(self._model_for(False), verbose, least_squares_kwargs)
+        model = self._model_for(symmetric)
+        self._model = model
+        self.midplane_symmetric = symmetric
+        theta = result.x
+        self.fit_result = result
+        self.one_turn_map = model.to_map(model.coefficients(theta))
+        self.generators = model.generators(theta)
+        pred = np.array(self.one_turn_map.substitute(*self.z0)).real
+        self.fit_rms = np.sqrt(np.mean((pred - self.z1) ** 2, axis=1))
+
+    def _fit(
+        self, model: _LieMapModel, verbose: int, least_squares_kwargs: dict[str, Any]
+    ) -> OptimizeResult:
+        """
+        Least-squares fit of the generators of a model.
+
+        Parameters
+        ----------
+        model : _LieMapModel
+            Model to fit.
+        verbose : int
+            Verbosity of :func:`scipy.optimize.least_squares`.
+        least_squares_kwargs : dict
+            Further arguments for :func:`scipy.optimize.least_squares`.
+
+        Returns
+        -------
+        scipy.optimize.OptimizeResult
+            Result of the fit (``x`` the generator coefficients).
+        """
         weights, target, _ = self._least_squares_system()
         cache: dict[str, Any] = {}
 
@@ -879,13 +1078,8 @@ class OneTurnMap4D:
             fun, np.zeros(model.n_params), jac=jac, verbose=verbose, **options
         )
         if not result.success:
-            warnings.warn(f"The fit did not converge: {result.message}", stacklevel=2)
-        theta = result.x
-        self.fit_result = result
-        self.one_turn_map = model.to_map(model.coefficients(theta))
-        self.generators = model.generators(theta)
-        pred = np.array(self.one_turn_map.substitute(*self.z0)).real
-        self.fit_rms = np.sqrt(np.mean((pred - self.z1) ** 2, axis=1))
+            warnings.warn(f"The fit did not converge: {result.message}", stacklevel=3)
+        return result
 
     def track_map(self, z: np.ndarray, num_turns: int = 1) -> np.ndarray:
         """
