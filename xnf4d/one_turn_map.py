@@ -500,7 +500,8 @@ class OneTurnMap4D:
     Symplectic polynomial one-turn map of an ``xtrack`` line.
 
     Particles are generated in transverse normalised coordinates, uniformly
-    in the actions ``Jx, Jy`` up to ``sigma_limit**2 / 2`` and in the phases,
+    in the actions ``Jx, Jy`` up to ``sigma_limit**2 / 2`` and in the phases
+    (leaving out, with ``sigma_min``, the core ``2 (Jx + Jy) < sigma_min**2``),
     tracked for one turn, and a Lie map (see the module documentation) of
     order ``max_map_order`` is fitted to the result by least squares. The
     line only needs to support tracking.
@@ -524,6 +525,15 @@ class OneTurnMap4D:
         Vertical normalised emittance [m].
     sigma_limit : float, default 10
         Maximum amplitude of the fitted region, in units of the beam size.
+    sigma_min : float, default 0
+        Minimum 4D amplitude ``sqrt(2 (Jx + Jy))`` of the fitted region, in
+        units of the beam size. A positive value fits the map on a shell,
+        e.g. for the tails of a distribution, where a fit including the core
+        would be less accurate. The map is then only meant to be used at
+        amplitudes above ``sigma_min``; the boundary is a level set of
+        ``Jx + Jy``, the invariant kept by a normal form of the coupling
+        resonance, so that maps fitted on different shells can be joined on
+        it (see :func:`xnf4d.distributions.seam_mismatch`).
     num_particles : int, optional
         Number of particles tracked for the fit. By default 10 times the
         number of monomials of the map (at least 1000). Lost particles are
@@ -578,6 +588,11 @@ class OneTurnMap4D:
         Normalised coordinates of the surviving particles before and after
         one turn (with ``midplane_symmetry="auto"``, followed by those of
         the mirrored particles).
+    sigma_limit : float
+        Maximum amplitude of the fitted region in each plane [beam sizes].
+    sigma_min : float
+        Minimum 4D amplitude ``sqrt(2 (Jx + Jy))`` of the fitted region
+        [beam sizes].
     midplane_symmetry : bool or "auto"
         Requested treatment of the midplane symmetry.
     midplane_asymmetry : float or None
@@ -600,12 +615,18 @@ class OneTurnMap4D:
         seed: int | np.random.Generator | None = None,
         twiss_kwargs: dict[str, Any] | None = None,
         midplane_symmetry: bool | Literal["auto"] = "auto",
+        sigma_min: float = 0.0,
     ) -> None:
         if method not in ("6d", "4d"):
             raise ValueError(f"method must be '6d' or '4d', got {method!r}.")
         _check_symmetry_option(midplane_symmetry, allow_auto=True)
         if sigma_limit <= 0:
             raise ValueError(f"sigma_limit must be positive, got {sigma_limit}.")
+        if not 0 <= sigma_min < sigma_limit:
+            raise ValueError(
+                f"sigma_min must satisfy 0 <= sigma_min < sigma_limit, got {sigma_min}."
+            )
+        self.sigma_min = float(sigma_min)
         self.line = line
         self.max_map_order = int(max_map_order)
         self.nemitt_x = float(nemitt_x)
@@ -759,6 +780,7 @@ class OneTurnMap4D:
         if sigma_limit is None:
             sigma_limit = float(np.max(np.abs(z0)))
         obj.sigma_limit = float(sigma_limit)
+        obj.sigma_min = 0.0
         obj.z0, obj.z1 = z0, z1
         return obj
 
@@ -782,6 +804,9 @@ class OneTurnMap4D:
         """
         Random initial conditions, uniform in actions and phases.
 
+        The actions are uniform in ``[0, sigma_limit**2 / 2]`` each, without
+        the core ``Jx + Jy < sigma_min**2 / 2``.
+
         Parameters
         ----------
         rng : numpy.random.Generator
@@ -794,7 +819,13 @@ class OneTurnMap4D:
         numpy.ndarray, shape (4, n)
             Normalised coordinates.
         """
-        J = rng.uniform(0, self.sigma_limit**2 / 2, (2, n))
+        # without a shell, draw exactly as before (same sample for a given seed)
+        J = rng.uniform(0, self.sigma_limit**2 / 2, (2, n)) if self.sigma_min == 0 else np.empty((2, 0))
+        while J.shape[1] < n:
+            cand = rng.uniform(0, self.sigma_limit**2 / 2, (2, 2 * n))
+            cand = cand[:, cand.sum(axis=0) >= self.sigma_min**2 / 2]
+            J = np.concatenate([J, cand], axis=1)
+        J = J[:, :n]
         phi = rng.uniform(0, 2 * np.pi, (2, n))
         r = np.sqrt(2 * J)
         return np.array(

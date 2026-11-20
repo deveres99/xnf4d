@@ -712,3 +712,44 @@ class TestMidplaneSymmetryLine:
     def test_invalid_option(self):
         with pytest.raises(ValueError, match="midplane_symmetry"):
             OneTurnMap4D(small_line(), 3, 2.5e-6, 2.5e-6, 6, midplane_symmetry="maybe")
+
+
+
+# --------------------------------------------------------------------------- #
+# Fit on a shell of amplitudes
+# --------------------------------------------------------------------------- #
+
+
+class TestSigmaMin:
+    def test_shell_sample(self):
+        otm = OneTurnMap4D(small_line(), 3, 2.5e-6, 2.5e-6, 6, seed=1, num_particles=1500,
+                           midplane_symmetry=False, sigma_min=4.0)
+        assert otm.sigma_min == 4.0 and otm.z0.shape == (4, 1500)
+        r2 = otm.z0[0] ** 2 + otm.z0[1] ** 2 + otm.z0[2] ** 2 + otm.z0[3] ** 2
+        assert r2.min() >= 16 - 1e-9
+        assert np.hypot(otm.z0[0], otm.z0[1]).max() <= 6 + 1e-9
+        assert np.hypot(otm.z0[2], otm.z0[3]).max() <= 6 + 1e-9
+
+    def test_default_is_full_region(self):
+        otm = OneTurnMap4D(small_line(), 3, 2.5e-6, 2.5e-6, 6, seed=1, num_particles=1500,
+                           midplane_symmetry=False)
+        assert otm.sigma_min == 0.0
+        r2 = otm.z0[0] ** 2 + otm.z0[1] ** 2 + otm.z0[2] ** 2 + otm.z0[3] ** 2
+        # about 10 % of the points lie inside the 4 sigma core of the shell test
+        assert np.mean(r2 < 16) > 0.05
+
+    def test_shell_fit_is_accurate_on_the_shell(self):
+        otm = OneTurnMap4D(small_line(), 5, 2.5e-6, 2.5e-6, 6, seed=1, sigma_min=3.0)
+        otm.compute()
+        z = otm._sample(np.random.default_rng(5), 200)
+        z1, _ = otm.track(z)
+        assert np.max(np.abs(otm.track_map(z) - z1)) < 10 * otm.fit_rms.max() + 1e-12
+
+    @pytest.mark.parametrize("sigma_min", [-1.0, 6.0, 7.0])
+    def test_invalid(self, sigma_min):
+        with pytest.raises(ValueError, match="sigma_min"):
+            OneTurnMap4D(small_line(), 3, 2.5e-6, 2.5e-6, 6, sigma_min=sigma_min)
+
+    def test_from_data_has_no_shell(self, rng):
+        z0 = sample(rng, 200)
+        assert OneTurnMap4D.from_data(z0, z0, rotation(), 3).sigma_min == 0.0
