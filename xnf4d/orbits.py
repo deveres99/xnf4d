@@ -20,6 +20,9 @@ normal form coordinates.
 :func:`hamiltonian_orbits` gives the orbits predicted by the interpolating
 Hamiltonian of a normal form, as its contours through the same initial
 conditions, for comparison with tracking (see :class:`HamiltonianOrbits`).
+:func:`hamiltonian_tori` gives the full 4D invariant tori instead, which also
+describe the exchange of energy between coupled planes (see
+:class:`HamiltonianTori`).
 """
 
 from __future__ import annotations
@@ -38,8 +41,10 @@ from .numerical_normal_form import NormalForm4D, complex_to_real, real_to_comple
 __all__ = [
     "DEFAULT_ANGLES",
     "HamiltonianOrbits",
+    "HamiltonianTori",
     "Orbits",
     "hamiltonian_orbits",
+    "hamiltonian_tori",
     "initial_conditions",
     "track_orbits",
 ]
@@ -992,3 +997,870 @@ def hamiltonian_orbits(
         curves_norm=curves_norm,
         normal_form=normal_form,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Invariant tori of the normal form Hamiltonian
+# --------------------------------------------------------------------------- #
+
+#: Terms of H smaller than this fraction of its largest term are ignored when
+#: identifying the resonance (rounding noise).
+_RES_TOL = 1e-12
+#: Accuracy of the inversion of Psi for the points of the tori [beam sizes].
+_TORI_TOL = 1e-10
+#: Newton steps refining the points of the reduced curves onto the level set.
+_REFINE_STEPS = 4
+#: A reduced curve spanning fewer grid cells than this is not resolved.
+_MIN_CELLS = 10
+#: Factor by which successive zoomed grids of an unresolved reduced curve
+#: shrink.
+_ZOOM = 4.0
+#: Smallest zoomed grid half-width, relative to the initial amplitude of the
+#: chart plane (the start must lie well inside the grid).
+_ZOOM_FLOOR = 1.5
+
+
+@dataclass
+class HamiltonianTori:
+    """
+    Invariant tori of the interpolating Hamiltonian of a normal form.
+
+    Returned by :func:`hamiltonian_tori`. For each initial condition, the
+    torus is the set of points of the 4D phase space that the normal form
+    predicts its orbit to fill. It is given as arrays of points
+    ``(4, M, T)``: along axis 1 the points follow a curve of the reduced
+    motion (see :func:`hamiltonian_tori`), along axis 2 the phase that does
+    not appear in ``H``. An orbit consists of one torus, or of
+    several for the islands of a resonance.
+
+    To compare with tracking in the plane of a particle, plot all points
+    (the projection of the torus is a band when the planes are coupled), or
+    the curves at fixed values of the free phase::
+
+        for t in tori.tori_norm[i]:
+            ax.plot(t[0].ravel(), t[1].ravel(), ",")       # band in (x, px)
+            ax.plot(t[0][:, 0], t[1][:, 0])                # one curve
+
+    Attributes
+    ----------
+    plane : numpy.ndarray of str, shape (num_particles,)
+        Plane of each initial condition (that of the larger normalised
+        amplitude).
+    resonance : tuple of 2 int or None
+        Resonance ``(n, m)`` on which ``H`` depends through the phase
+        ``n theta1 + m theta2``, or None if ``H`` depends on the actions only.
+    h0 : numpy.ndarray, shape (num_particles,)
+        Value of ``h = Re(-i H)`` at each initial condition.
+    invariant : numpy.ndarray, shape (num_particles,)
+        Second invariant ``m |zeta1|^2 - n |zeta2|^2`` (``nan`` if
+        ``resonance`` is None, when ``|zeta1|`` and ``|zeta2|`` are both
+        invariant).
+    z0_norm, z0_nf : numpy.ndarray, shape (4, num_particles)
+        Initial normalised and normal form coordinates.
+    tori_nf, tori_norm : list of list of numpy.ndarray
+        ``tori_nf[i]`` holds the tori of particle ``i``, each an array of
+        shape ``(4, M, T)`` of normal form coordinates;
+        ``tori_norm`` the same in normalised coordinates (``nan`` where
+        ``Psi`` could not be inverted).
+    normal_form : NormalForm4D or list of NormalForm4D
+        The normal form used, or the normal forms joined by seams.
+    region : numpy.ndarray of int, shape (num_particles,) or None
+        With normal forms joined by seams, the index of the normal form used
+        for each particle.
+    """
+
+    plane: np.ndarray
+    resonance: tuple[int, int] | None
+    h0: np.ndarray
+    invariant: np.ndarray
+    z0_norm: np.ndarray
+    z0_nf: np.ndarray
+    tori_nf: list[list[np.ndarray]]
+    tori_norm: list[list[np.ndarray]]
+    normal_form: NormalForm4D | list[NormalForm4D] = field(repr=False)
+    region: np.ndarray | None = None
+
+    @property
+    def num_particles(self) -> int:
+        """
+        Number of particles.
+
+        Returns
+        -------
+        int
+            Number of initial conditions.
+        """
+        return int(len(self.plane))
+
+    def select(self, plane: Literal["x", "y"]) -> HamiltonianTori:
+        """
+        Tori of the particles started in one plane.
+
+        The particles keep their order, so the result lines up row by row
+        with ``Orbits.select(plane)`` of the orbits the tori were computed
+        from.
+
+        Parameters
+        ----------
+        plane : {"x", "y"}
+            Plane to select.
+
+        Returns
+        -------
+        HamiltonianTori
+            The tori of these particles only.
+
+        Raises
+        ------
+        ValueError
+            If ``plane`` is not ``"x"`` or ``"y"``.
+        """
+        if plane not in ("x", "y"):
+            raise ValueError(f"plane must be 'x' or 'y', got {plane!r}.")
+        idx = np.flatnonzero(self.plane == plane)
+        return HamiltonianTori(
+            plane=self.plane[idx],
+            resonance=self.resonance,
+            h0=self.h0[idx],
+            invariant=self.invariant[idx],
+            z0_norm=self.z0_norm[:, idx],
+            z0_nf=self.z0_nf[:, idx],
+            tori_nf=[self.tori_nf[i] for i in idx],
+            tori_norm=[self.tori_norm[i] for i in idx],
+            normal_form=self.normal_form,
+            region=None if self.region is None else self.region[idx],
+        )
+
+    def points(self, i: int, coordinates: Literal["nf", "norm"] = "norm") -> np.ndarray:
+        """
+        All points of the tori of one particle.
+
+        Parameters
+        ----------
+        i : int
+            Particle.
+        coordinates : {"nf", "norm"}, default "norm"
+            Normal form or normalised coordinates.
+
+        Returns
+        -------
+        numpy.ndarray, shape (4, M)
+            Points (those that could not be computed are left out).
+
+        Raises
+        ------
+        ValueError
+            If ``coordinates`` is invalid.
+        """
+        if coordinates not in ("nf", "norm"):
+            raise ValueError(f"coordinates must be 'nf' or 'norm', got {coordinates!r}.")
+        tori = self.tori_nf[i] if coordinates == "nf" else self.tori_norm[i]
+        if not tori:
+            return np.empty((4, 0))
+        pts = np.concatenate([t.reshape(4, -1) for t in tori], axis=1)
+        return np.real(pts[:, np.all(np.isfinite(pts), axis=0)])
+
+    def distance(
+        self, orbits: Orbits, coordinates: Literal["nf", "norm"] = "norm"
+    ) -> np.ndarray:
+        """
+        4D distance of tracked orbit points from the tori.
+
+        The distance is that to the nearest point of the particle's tori, so
+        it includes the spacing of the points (about
+        ``2 pi r / sqrt(num_points)`` for a torus of radius ``r``).
+
+        Parameters
+        ----------
+        orbits : Orbits
+            Tracked orbits started at the same initial conditions, in the
+            same order; with normal form coordinates for ``coordinates="nf"``.
+        coordinates : {"nf", "norm"}, default "norm"
+            Compare in normal form or in normalised coordinates.
+
+        Returns
+        -------
+        numpy.ndarray, shape (num_particles, num_turns)
+            Distances [beam sizes] (``nan`` where the orbit is ``nan`` or a
+            particle has no torus).
+
+        Raises
+        ------
+        ValueError
+            If the orbits do not start at the same initial conditions, lack
+            normal form coordinates, or ``coordinates`` is invalid.
+        """
+        from scipy.spatial import cKDTree
+
+        z0 = np.array([orbits.x_norm[:, 0], orbits.px_norm[:, 0],
+                       orbits.y_norm[:, 0], orbits.py_norm[:, 0]])
+        if z0.shape != self.z0_norm.shape or not np.allclose(z0, self.z0_norm, atol=1e-9):
+            raise ValueError("The orbits do not start at the initial conditions of the tori.")
+        names = _NORM if coordinates == "norm" else _NF
+        if coordinates == "nf" and not orbits.has_normal_form:
+            raise ValueError("The orbits have no normal form coordinates.")
+        pts = np.array([getattr(orbits, c) for c in names])  # (4, N, T)
+        out = np.full(pts.shape[1:], np.nan)
+        for i in range(self.num_particles):
+            torus = self.points(i, coordinates)
+            if torus.shape[1] == 0:
+                continue
+            p = pts[:, i].T
+            ok = np.all(np.isfinite(p), axis=1)
+            out[i, ok] = cKDTree(torus.T).query(p[ok])[0]
+        return out
+
+
+def _resonance_of(H: Any) -> tuple[int, int] | None:
+    """
+    Resonance on which a normal form Hamiltonian depends.
+
+    Every term ``c zeta1^a zeta1*^b zeta2^c zeta2*^d`` depends on the phases
+    through ``(a - b) theta1 + (c - d) theta2``. In a normal form with a
+    single resonance, all the vectors ``(a - b, c - d)`` are multiples of the
+    resonance ``(n, m)``.
+
+    Parameters
+    ----------
+    H : Polynom
+        Hamiltonian.
+
+    Returns
+    -------
+    tuple of 2 int or None
+        Primitive resonance ``(n, m)`` (first non-zero entry positive), or
+        None if ``H`` depends on the actions only.
+
+    Raises
+    ------
+    ValueError
+        If ``H`` depends on two independent combinations of the phases.
+    """
+    terms = [(t.exponents, complex(t.coeff)) for t in H.terms]
+    scale = max((abs(c) for _, c in terms), default=0.0)
+    vectors = {
+        (e[0] - e[1], e[2] - e[3])
+        for e, c in terms
+        if abs(c) > _RES_TOL * scale and (e[0] != e[1] or e[2] != e[3])
+    }
+    if not vectors:
+        return None
+    p, q = next(iter(vectors))
+    g = np.gcd(abs(p), abs(q))
+    n, m = p // g, q // g
+    if n < 0 or (n == 0 and m < 0):
+        n, m = -n, -m
+    if any(a * m - b * n != 0 for a, b in vectors):
+        raise ValueError(
+            "The Hamiltonian depends on two independent combinations of the "
+            "phases (a double resonance): its motion is not integrable and has "
+            "no invariant tori."
+        )
+    return int(n), int(m)
+
+
+def _resample(line: np.ndarray, num: int) -> np.ndarray:
+    """
+    Points equally spaced along a polyline.
+
+    Parameters
+    ----------
+    line : numpy.ndarray, shape (M, 2)
+        Polyline (closed if its ends coincide).
+    num : int
+        Number of points.
+
+    Returns
+    -------
+    numpy.ndarray, shape (num, 2)
+        Points (for a closed polyline the last one is not repeated).
+    """
+    s = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(line, axis=0).T))])
+    closed = np.allclose(line[0], line[-1])
+    t = np.linspace(0, s[-1], num, endpoint=not closed)
+    return np.stack([np.interp(t, s, line[:, 0]), np.interp(t, s, line[:, 1])], axis=1)
+
+
+def hamiltonian_tori(
+    normal_form: NormalForm4D | Sequence[NormalForm4D],
+    initial: Orbits | np.ndarray,
+    num_points: int = 32768,
+    grid_size: int = 401,
+    margin: float = 1.5,
+    seams: Sequence[float] | None = None,
+) -> HamiltonianTori:
+    """
+    Invariant tori of the interpolating Hamiltonian through initial points.
+
+    With a single normal form, see :func:`_hamiltonian_tori_single` for the
+    method. Several normal forms (2 to 4, e.g. from one-turn maps fitted on
+    different amplitude ranges, all keeping the same resonance) can be joined
+    at ``seams`` of the normal form amplitude
+    ``rho = sqrt(|zeta1|^2 + |zeta2|^2)``, as for the distributions of
+    :mod:`xnf4d.distributions`: each initial condition ``z0`` gets its torus
+    from a normal form ``k`` with ``rho_k(z0)`` between ``seams[k - 1]`` and
+    ``seams[k]``. Far outside its fit range a normal form can place a point
+    in its band by accident, so among several such normal forms the one
+    whose band is closest to the normalised amplitude ``|z0|`` is used; if
+    there is none, the normal form of the band of ``|z0|``.
+
+    Parameters
+    ----------
+    normal_form : NormalForm4D or sequence of NormalForm4D
+        Computed normal form, or normal forms from the innermost.
+    initial : Orbits or array_like, shape (4, N)
+        Initial conditions (see :func:`_hamiltonian_tori_single`).
+    num_points, grid_size, margin
+        See :func:`_hamiltonian_tori_single`.
+    seams : sequence of float, optional
+        Increasing seam radii [beam sizes], one fewer than the normal forms.
+
+    Returns
+    -------
+    HamiltonianTori
+        The tori (with :attr:`HamiltonianTori.region` for several normal
+        forms).
+
+    Raises
+    ------
+    ValueError
+        If a normal form is not computed, has two resonances, the normal
+        forms keep different resonances, or the seams are invalid.
+    """
+    if not isinstance(normal_form, Sequence):
+        if seams is not None and len(seams) > 0:
+            raise ValueError("seams require a sequence of normal forms.")
+        return _hamiltonian_tori_single(normal_form, initial, num_points, grid_size, margin)
+    forms = list(normal_form)
+    seams = np.asarray([] if seams is None else seams, dtype=float)
+    if not 2 <= len(forms) <= 4:
+        raise ValueError(f"Between 2 and 4 normal forms can be joined, got {len(forms)}.")
+    if seams.ndim != 1 or seams.size != len(forms) - 1:
+        raise ValueError(
+            f"{len(forms)} normal forms need {len(forms) - 1} seam radii, got {seams.tolist()}."
+        )
+    if np.any(seams <= 0) or np.any(np.diff(seams) <= 0):
+        raise ValueError(f"The seam radii must be positive and increasing, got {seams.tolist()}.")
+    for nf in forms:
+        if nf.H is None or nf.Psi is None:
+            raise ValueError("The normal form has not been computed.")
+    resonances = {_resonance_of(nf.H) for nf in forms}
+    if len(resonances) > 1:
+        raise ValueError(
+            f"The normal forms keep different resonances {sorted(map(str, resonances))}; "
+            "their tori cannot be joined."
+        )
+    z0, planes = _initial_points(initial)
+    # band of each normal form, and amplitude of the points in each
+    lower = np.concatenate([[0.0], seams])
+    upper = np.concatenate([seams, [np.inf]])
+    rho = np.array([
+        np.sqrt(np.sum(np.abs(np.array(nf.norm_to_nf(*real_to_complex(*z0)))[[0, 2]]) ** 2, axis=0))
+        for nf in forms
+    ])
+    inside = (rho >= lower[:, None]) & (rho < upper[:, None])
+    # Far outside its fit range a normal form can map a point to a radius in
+    # its own band by accident: among the normal forms placing the point in
+    # their band, take the one whose band is closest to its normalised
+    # amplitude; if none does, the band of the normalised amplitude.
+    r_lin = np.sqrt(np.sum(z0**2, axis=0))
+    off_band = np.maximum(lower[:, None] - r_lin, r_lin - upper[:, None]).clip(min=0)
+    region = np.where(
+        inside.any(axis=0),
+        np.argmin(np.where(inside, off_band, np.inf), axis=0),
+        np.searchsorted(seams, r_lin, side="right"),
+    )
+    n = z0.shape[1]
+    parts = {}
+    for k, nf in enumerate(forms):
+        idx = np.flatnonzero(region == k)
+        if idx.size:
+            parts[k] = (idx, _hamiltonian_tori_single(nf, z0[:, idx], num_points, grid_size, margin))
+    h0, invariant, z0_nf = np.empty(n), np.empty(n), np.empty((4, n))
+    tori_nf: list[list[np.ndarray]] = [[] for _ in range(n)]
+    tori_norm: list[list[np.ndarray]] = [[] for _ in range(n)]
+    for idx, part in parts.values():
+        h0[idx], invariant[idx], z0_nf[:, idx] = part.h0, part.invariant, part.z0_nf
+        for j, i in enumerate(idx):
+            tori_nf[i], tori_norm[i] = part.tori_nf[j], part.tori_norm[j]
+    return HamiltonianTori(
+        plane=planes, resonance=resonances.pop(), h0=h0, invariant=invariant,
+        z0_norm=z0, z0_nf=z0_nf, tori_nf=tori_nf, tori_norm=tori_norm,
+        normal_form=forms, region=region,
+    )
+
+
+def _initial_points(initial: Orbits | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Initial normalised coordinates and planes of initial conditions.
+
+    Parameters
+    ----------
+    initial : Orbits or array_like, shape (4, N)
+        Tracked orbits (their first turn and labels are used) or normalised
+        coordinates.
+
+    Returns
+    -------
+    z0 : numpy.ndarray, shape (4, N)
+        Normalised coordinates.
+    planes : numpy.ndarray of str, shape (N,)
+        Plane of each point (the labels of the orbits, or the plane of the
+        larger normalised amplitude).
+
+    Raises
+    ------
+    ValueError
+        If the array has the wrong shape.
+    """
+    if isinstance(initial, Orbits):
+        z0 = np.array([initial.x_norm[:, 0], initial.px_norm[:, 0],
+                       initial.y_norm[:, 0], initial.py_norm[:, 0]])
+        return z0, np.asarray(initial.plane)
+    z0 = np.atleast_2d(np.asarray(initial, dtype=float))
+    if z0.ndim != 2 or z0.shape[0] != 4:
+        raise ValueError(f"initial must have shape (4, N), got {z0.shape}.")
+    return z0, np.where(np.hypot(z0[0], z0[1]) >= np.hypot(z0[2], z0[3]), "x", "y")
+
+
+def _hamiltonian_tori_single(
+    normal_form: NormalForm4D,
+    initial: Orbits | np.ndarray,
+    num_points: int = 32768,
+    grid_size: int = 401,
+    margin: float = 1.5,
+) -> HamiltonianTori:
+    """
+    Invariant tori of the interpolating Hamiltonian of one normal form.
+
+    Unlike :func:`hamiltonian_orbits`, which draws the contour of ``h`` in one
+    plane with the other plane frozen, this follows the 4D motion, in which
+    the planes can exchange energy (e.g. near a coupling resonance).
+
+    ``h = Re(-i H)`` depends on the actions ``A1 = |zeta1|^2``,
+    ``A2 = |zeta2|^2`` and, in a normal form with one resonance ``(n, m)``
+    (given by ``res_basis1``), on the phase ``phi = n theta1 + m theta2``. It
+    is invariant under the shifts of the phases along ``(m, -n)``, so
+    ``K = m A1 - n A2`` is a second invariant (``A1 + A2`` for the coupling
+    resonance ``(1, -1)``). At fixed ``K`` the motion reduces to one degree
+    of freedom, whose orbits are the level curves of ``h``; the torus is such
+    a curve swept along the free phase. Steps:
+
+    1. ``zeta0 = Psi(z0)`` gives ``h0`` and ``K``.
+    2. The reduced curve is the contour ``h = h0`` in the complex plane
+       ``zeta_j`` of one oscillator (``j`` of the plane whose phase enters
+       ``phi``, of smaller action), the other one having its action set by
+       ``K`` and its phase fixed at the initial value. In this chart the
+       state with ``A_j = 0`` is a regular point (the origin), which in polar
+       coordinates ``(phi, A_j)`` it is not. The contour is computed on a grid
+       and its points refined by Newton's method onto ``h = h0``. The curves
+       of the orbit are selected as in :func:`hamiltonian_orbits` (several for
+       an island chain).
+    3. Each point is swept along the free phase ``(m, -n)``.
+    4. The points are mapped to normalised coordinates by solving
+       ``Psi(z) = zeta`` with Newton's method (consistent with the normal form
+       coordinates ``Psi(z)`` of tracked particles).
+
+    If ``H`` depends on the actions only (non-resonant normal form), the tori
+    are those of constant ``A1`` and ``A2``, swept along both phases (axis 1
+    the phase of the particle's plane). A normal form with two resonances
+    has no invariant tori and is rejected.
+
+    ``h`` and ``K`` are invariants of the one-turn map for non-resonant and
+    quasi-resonant normal forms (see :func:`hamiltonian_orbits`).
+
+    Parameters
+    ----------
+    normal_form : NormalForm4D
+        Computed normal form, acting on the same normalised coordinates as
+        the initial conditions.
+    initial : Orbits or array_like, shape (4, N)
+        Initial conditions: tracked orbits (their first turn and labels are
+        used) or normalised coordinates ``(x_norm, px_norm, y_norm, py_norm)``
+        (any 4D points).
+    num_points : int, default 32768
+        Approximate number of points of the tori of an orbit, divided between
+        the two directions of the tori (along the reduced curves and along
+        the free phase) so that the points are equally spaced in both.
+    grid_size : int, default 401
+        Number of grid points per axis of the contour of the reduced motion.
+    margin : float, default 1.5
+        Half-width of the grid, relative to the initial amplitude of the
+        chart plane, when the reduced motion is not bounded by ``K``
+        (otherwise the grid covers all the allowed actions).
+
+    Returns
+    -------
+    HamiltonianTori
+        The tori.
+
+    Raises
+    ------
+    ValueError
+        If the normal form is not computed, has two resonances, or the
+        arguments are invalid.
+
+    Warns
+    -----
+    UserWarning
+        If no contour is found for some initial conditions, or ``Psi`` could
+        not be inverted at some points of the tori.
+    """
+    from .distributions import _PolyEvaluator, _to_complex, _Transforms
+
+    if normal_form.H is None or normal_form.Psi is None:
+        raise ValueError("The normal form has not been computed.")
+    if grid_size < 3 or num_points < 64:
+        raise ValueError("grid_size >= 3 and num_points >= 64 are required.")
+    z0, planes = _initial_points(initial)
+
+    resonance = _resonance_of(normal_form.H)
+    evaluate_h = _PolyEvaluator([normal_form.H])
+    transforms = _Transforms(normal_form, "x")
+
+    def h_of(zeta: np.ndarray) -> np.ndarray:
+        return np.real(-1j * evaluate_h(zeta)[0])
+
+    zeta0 = np.array(normal_form.norm_to_nf(*real_to_complex(*z0)), dtype=complex)
+    z0_nf = np.real(np.array(complex_to_real(*zeta0)))
+    h0 = h_of(zeta0)
+    amp0 = np.abs(zeta0[[0, 2]]) ** 2  # (2, N): A1, A2
+    th0 = np.angle(zeta0[[0, 2]])
+    if resonance is None:
+        invariant = np.full(z0.shape[1], np.nan)
+    else:
+        n, m = resonance
+        invariant = m * amp0[0] - n * amp0[1]
+
+    tori_nf: list[list[np.ndarray]] = []
+    n_empty = 0
+    for i in range(z0.shape[1]):
+        r = np.sqrt(amp0[:, i])
+        if resonance is None:
+            # tori of constant actions; axis 1 the phase of the particle's plane
+            own = 0 if planes[i] == "x" else 1
+            n_a, n_b = _split_points(num_points, 2 * np.pi * r[own], 2 * np.pi * r[1 - own])
+            a = np.linspace(0, 2 * np.pi, n_a, endpoint=False)[:, None]
+            b = np.linspace(0, 2 * np.pi, n_b, endpoint=False)[None, :]
+            th = [None, None]
+            th[own] = th0[own, i] + a + 0 * b
+            th[1 - own] = th0[1 - own, i] + 0 * a + b
+            tori_nf.append([_torus_from_phases(r[0], r[1], th[0], th[1])])
+            continue
+        curves = _reduced_curves(
+            normal_form, h_of, resonance, amp0[:, i], th0[:, i], h0[i], invariant[i],
+            grid_size, margin,
+        )
+        if not curves:
+            n_empty += 1
+            tori_nf.append([])
+            continue
+        j, w, curve_list, g, step = curves
+
+        def chart_to_torus(p: np.ndarray, tau: np.ndarray) -> np.ndarray:
+            # points (M, 2) of the chart swept along the free phase tau (1, T)
+            a_j = np.sum(p**2, axis=1)
+            a_o = _other_action(resonance, j, a_j, invariant[i])
+            th_j = np.arctan2(p[:, 1], p[:, 0])[:, None] + tau * w[j]
+            th_o = th0[1 - j, i] + tau * w[1 - j] + 0 * th_j
+            r_j, r_o = np.sqrt(a_j)[:, None], np.sqrt(np.maximum(a_o, 0.0))[:, None]
+            if j == 0:
+                return _torus_from_phases(r_j, r_o, th_j, th_o)
+            return _torus_from_phases(r_o, r_j, th_o, th_j)
+
+        # 4D lengths of the reduced curves and of the loops of the free phase,
+        # to space the points equally along both directions of the tori
+        zero = np.zeros((1, 1))
+        lengths, loops = [], []
+        for c in curve_list:
+            pts = np.real(np.array(complex_to_real(*chart_to_torus(c, zero)[:, :, 0])))
+            lengths.append(np.sum(np.linalg.norm(np.diff(pts, axis=1), axis=0)))
+            loops.append(2 * np.pi * np.mean(np.sqrt(w[0] ** 2 * (pts[0] ** 2 + pts[1] ** 2)
+                                                     + w[1] ** 2 * (pts[2] ** 2 + pts[3] ** 2))))
+        lengths = np.array(lengths)
+        if lengths.sum() > 0:
+            n_s, n_t = _split_points(num_points, lengths.sum(), float(np.mean(loops)))
+            counts = np.maximum(8, np.round(n_s * lengths / lengths.sum())).astype(int)
+        else:  # reduced curve below resolution: a single point
+            n_t, counts = num_points, [1]
+        tau = np.linspace(0, 2 * np.pi, n_t, endpoint=False)[None, :]
+        tori = []
+        for c, k in zip(curve_list, counts):
+            # resample, then refine onto h = h0 (interpolation leaves the level)
+            p = c if len(c) == 1 else _refine_onto_level(_resample(c, int(k)), g, h0[i], step)
+            tori.append(chart_to_torus(p, tau))
+        tori_nf.append(tori)
+
+    tori_norm: list[list[np.ndarray]] = []
+    n_failed = n_total = 0
+    for tori in tori_nf:
+        out = []
+        for t in tori:
+            z = transforms.psi_inverse(t, _TORI_TOL)
+            n_failed += int(np.sum(~np.all(np.isfinite(z), axis=0)))
+            n_total += int(np.prod(z.shape[1:]))
+            out.append(z)
+        tori_norm.append(out)
+    tori_nf = [[np.real(np.array(complex_to_real(*t))) for t in tori] for tori in tori_nf]
+    if n_empty:
+        warnings.warn(
+            f"No contour of the reduced motion was found for {n_empty} initial "
+            "conditions (outside the grid?); their tori are empty.",
+            stacklevel=2,
+        )
+    if n_failed:
+        warnings.warn(
+            f"Psi could not be inverted at {n_failed} of {n_total} points of the "
+            "tori (the normal form is not valid there); they are nan.",
+            stacklevel=2,
+        )
+    return HamiltonianTori(
+        plane=np.asarray(planes), resonance=resonance, h0=h0, invariant=invariant,
+        z0_norm=z0, z0_nf=z0_nf, tori_nf=tori_nf, tori_norm=tori_norm,
+        normal_form=normal_form,
+    )
+
+
+def _split_points(total: int, length_a: float, length_b: float) -> tuple[int, int]:
+    """
+    Numbers of points along the two directions of a torus.
+
+    Parameters
+    ----------
+    total : int
+        Approximate total number of points.
+    length_a, length_b : float
+        Lengths of the torus along the two directions.
+
+    Returns
+    -------
+    n_a, n_b : int
+        Numbers of points, with ``n_a n_b`` about ``total`` and spacings
+        ``length_a / n_a`` and ``length_b / n_b`` about equal (at least 8
+        points along ``a`` and 1 along ``b``).
+    """
+    if not length_b > 0:
+        return total, 1
+    if not length_a > 0:
+        return 8, max(1, total // 8)
+    n_a = int(np.clip(round(np.sqrt(total * length_a / length_b)), 8, total))
+    return n_a, max(1, round(total / n_a))
+
+
+def _torus_from_phases(
+    r1: np.ndarray, r2: np.ndarray, th1: np.ndarray, th2: np.ndarray
+) -> np.ndarray:
+    """
+    Complex normal form coordinates from amplitudes and phases.
+
+    Parameters
+    ----------
+    r1, r2 : array_like
+        Amplitudes ``|zeta1|``, ``|zeta2|`` (broadcast with the phases).
+    th1, th2 : array_like
+        Phases.
+
+    Returns
+    -------
+    numpy.ndarray, shape (4, *S)
+        ``(zeta1, zeta1*, zeta2, zeta2*)``.
+    """
+    a = np.asarray(r1) * np.exp(1j * np.asarray(th1))
+    b = np.asarray(r2) * np.exp(1j * np.asarray(th2))
+    a, b = np.broadcast_arrays(a, b)
+    return np.array([a, np.conj(a), b, np.conj(b)])
+
+
+def _other_action(
+    resonance: tuple[int, int], j: int, a_j: np.ndarray, invariant: float
+) -> np.ndarray:
+    """
+    Action of the other oscillator from ``K = m A1 - n A2``.
+
+    Parameters
+    ----------
+    resonance : tuple of 2 int
+        ``(n, m)``.
+    j : {0, 1}
+        Oscillator whose action ``a_j`` is given (its coefficient non-zero).
+    a_j : numpy.ndarray
+        Action ``|zeta_j|^2``.
+    invariant : float
+        ``K``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Action of the other oscillator (negative where not allowed).
+    """
+    n, m = resonance
+    if j == 0:
+        return (m * a_j - invariant) / n
+    return (invariant + n * a_j) / m
+
+
+def _reduced_curves(
+    normal_form: NormalForm4D,
+    h_of: Any,
+    resonance: tuple[int, int],
+    amp0: np.ndarray,
+    th0: np.ndarray,
+    h0: float,
+    invariant: float,
+    grid_size: int,
+    margin: float,
+) -> tuple[int, np.ndarray, list[np.ndarray]] | None:
+    """
+    Curves of the reduced motion through an initial point.
+
+    The reduced motion at fixed ``K`` is described in the complex plane
+    ``zeta_j`` of one oscillator (the other one with action set by ``K`` and
+    phase fixed at its initial value), where its orbits are the contours of
+    ``h``.
+
+    Parameters
+    ----------
+    normal_form : NormalForm4D
+        Normal form (its map ``N`` selects the curves of an island chain).
+    h_of : callable
+        ``h`` of complex normal form coordinates, shape ``(4, *S)``.
+    resonance : tuple of 2 int
+        ``(n, m)``.
+    amp0, th0 : numpy.ndarray, shape (2,)
+        Initial actions ``|zeta|^2`` and phases of the two oscillators.
+    h0 : float
+        Initial value of ``h``.
+    invariant : float
+        ``K``.
+    grid_size : int
+        Number of grid points per axis.
+    margin : float
+        Half-width of the grid relative to the initial amplitude of the chart
+        plane, if the reduced motion is unbounded.
+
+    Returns
+    -------
+    tuple or None
+        ``(j, w, curves, g, step)``: chart oscillator, free phase direction
+        ``(m, -n)``, curves (arrays of shape ``(M, 2)`` of
+        ``(Re zeta_j, Im zeta_j)`` on the grid), ``h`` in the chart
+        ``g(Re zeta_j, Im zeta_j)`` and the grid spacing; None if no contour
+        is found.
+    """
+    n, m = resonance
+    w = np.array([m, -n])
+    coef = (n, m)
+    candidates = [k for k in (0, 1) if coef[k] != 0]
+    j = min(candidates, key=lambda k: amp0[k])
+    o = 1 - j
+    if n * m < 0:  # bounded: the other action vanishes at the edge
+        a_max = invariant / m if j == 0 else -invariant / n
+        half = np.sqrt(max(a_max, 0.0)) * (1 + 1e-9)
+    else:
+        half = margin * np.sqrt(max(amp0[j], 1e-12 * max(amp0.sum(), 1e-30)))
+    if not half > 0:
+        return None
+
+    def zeta_at(u: np.ndarray, v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        a_j = u * u + v * v
+        a_o = _other_action(resonance, j, a_j, invariant)
+        zj = u + 1j * v
+        zo = np.sqrt(np.where(a_o >= 0, a_o, np.nan)) * np.exp(1j * th0[o])
+        zeta = np.array([zj, np.conj(zj), zo, np.conj(zo)]) if j == 0 else \
+            np.array([zo, np.conj(zo), zj, np.conj(zj)])
+        return zeta, a_o
+
+    def g(u: np.ndarray, v: np.ndarray) -> np.ndarray:
+        zeta, a_o = zeta_at(u, v)
+        return np.where(a_o >= 0, h_of(zeta), np.nan)
+
+    zj0 = np.sqrt(amp0[j]) * np.exp(1j * th0[j])
+    start = np.array([zj0.real, zj0.imag])
+
+    def one_turn(points: np.ndarray) -> np.ndarray:
+        # map one turn, then shift along the free phase back to the chart
+        zeta, _ = zeta_at(points[:, 0], points[:, 1])
+        image = np.array(normal_form.N.substitute(*zeta), dtype=complex)
+        tau = (th0[o] - np.angle(image[2 * o])) / w[o]
+        zj = image[2 * j] * np.exp(1j * tau * w[j])
+        return np.stack([zj.real, zj.imag], axis=1)
+
+    def contour(half_width: float, closed: bool) -> tuple[list[np.ndarray] | None, float]:
+        # curves of the orbit on a grid of the given half-width; None if the
+        # orbit is not resolved (no contour, none through the start, too few
+        # grid cells, or, if required, a curve cut by the edge of the grid)
+        axis = np.linspace(-half_width, half_width, grid_size)
+        step = axis[1] - axis[0]
+        U, V = np.meshgrid(axis, axis, indexing="xy")
+        lines = contourpy.contour_generator(x=U, y=V, z=np.ma.masked_invalid(g(U, V))).lines(h0)
+        lines = [ln for ln in lines if len(ln) >= 2]
+        if not lines:
+            return None, step
+        curves = _orbit_curves(lines, start, one_turn)
+        extent = max(np.ptp(c, axis=0).max() for c in curves)
+        near = _distance_to_polylines(start[None], curves)[0] <= 2 * step
+        resolved = near and extent >= _MIN_CELLS * step
+        if closed:
+            resolved = resolved and all(np.allclose(c[0], c[-1]) for c in curves)
+        return (curves if resolved else None), step
+
+    curves, step = contour(half, closed=False)
+    if curves is not None:
+        return j, w, curves, g, step
+    # A reduced orbit too small for the grid, typically near A_j = 0 where the
+    # other plane holds almost all the energy. The orbit through the start
+    # need not be small compared with the start amplitude (it can circle a
+    # fixed point away from the origin), so the grid is shrunk step by step
+    # and the largest grid on which the closed orbit is resolved is used.
+    r0 = float(np.hypot(*start))
+    if r0 <= 1e-12 * half:
+        # at the origin, a fixed point of the reduced motion
+        return j, w, [start[None, :]], g, step
+    width = half / _ZOOM
+    if width < _ZOOM_FLOOR * r0:
+        return None
+    while width >= _ZOOM_FLOOR * r0:
+        curves, step = contour(width, closed=True)
+        if curves is not None:
+            return j, w, curves, g, step
+        width /= _ZOOM
+    # smaller than the resolution of the finest grid: the start point
+    return j, w, [start[None, :]], g, step
+
+
+def _refine_onto_level(
+    points: np.ndarray, g: Any, level: float, step: float
+) -> np.ndarray:
+    """
+    Move points onto a level curve by Newton's method along the gradient.
+
+    Parameters
+    ----------
+    points : numpy.ndarray, shape (M, 2)
+        Points near the level curve (e.g. from a contour on a grid).
+    g : callable
+        ``g(u, v)`` of arrays of the same shape.
+    level : float
+        Level.
+    step : float
+        Grid spacing: steps longer than it are rejected (the point is kept).
+
+    Returns
+    -------
+    numpy.ndarray, shape (M, 2)
+        Refined points.
+    """
+    p = np.array(points, dtype=float)
+    eps = 1e-6 * step
+    with np.errstate(invalid="ignore", divide="ignore"):
+        for _ in range(_REFINE_STEPS):
+            u, v = p[:, 0], p[:, 1]
+            res = g(u, v) - level
+            gu = (g(u + eps, v) - g(u - eps, v)) / (2 * eps)
+            gv = (g(u, v + eps) - g(u, v - eps)) / (2 * eps)
+            norm2 = gu * gu + gv * gv
+            du, dv = -res * gu / norm2, -res * gv / norm2
+            ok = np.isfinite(du) & np.isfinite(dv) & (np.hypot(du, dv) < step)
+            p[ok, 0] += du[ok]
+            p[ok, 1] += dv[ok]
+    return p

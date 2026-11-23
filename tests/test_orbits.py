@@ -299,9 +299,11 @@ class TestMultithreaded:
 from xnf4d.numerical_normal_form import complex_to_real, real_to_complex  # noqa: E402
 from xnf4d.orbits import (  # noqa: E402
     HamiltonianOrbits,
+    HamiltonianTori,
     _distance_to_polylines,
     _initial_planes,
     hamiltonian_orbits,
+    hamiltonian_tori,
 )
 from xnf4d.polynom import Map, Polynom, Term  # noqa: E402
 
@@ -618,3 +620,259 @@ class TestOrbitSelection:
         centres = [np.angle(np.mean(c[0]) + 1j * np.mean(c[1]), deg=True) % 360
                    for c in ho.curves_nf[2]]
         np.testing.assert_allclose(sorted(centres), [45, 135, 225, 315], atol=1)
+
+
+# --------------------------------------------------------------------------- #
+# Invariant tori
+# --------------------------------------------------------------------------- #
+
+
+def tori_hamiltonian(extra: list[Term]) -> Polynom:
+    """Detuning (with cross terms) plus resonant terms."""
+    terms = [Term(1j * 1.0, 1, 1, 0, 0), Term(1j * 1.02, 0, 0, 1, 1),
+             Term(1j * 0.03, 2, 2, 0, 0), Term(1j * 0.02, 1, 1, 1, 1),
+             Term(-1j * 0.025, 0, 0, 2, 2)]
+    return Polynom(terms + extra)
+
+
+COUPLING = [Term(1j * 0.01, 1, 0, 0, 1), Term(1j * 0.01, 0, 1, 1, 0),
+            Term(1j * 0.004, 2, 0, 0, 2), Term(1j * 0.004, 0, 2, 2, 0)]
+ISLANDS = [Term(1j * 0.02, 4, 0, 0, 0), Term(1j * 0.02, 0, 4, 0, 0)]
+TORI_Z0 = np.array([[1.0, 3.0, 0.0, 0.5], [0.0, 0.5, 0.0, 0.0],
+                    [0.0, 0.0, 2.0, 1.5], [0.3, 0.0, 0.0, 0.0]])
+
+
+def flow_points(H: Polynom, z0: np.ndarray, t_end: float = 600.0, dt: float = 0.02) -> np.ndarray:
+    """Points of the Hamiltonian flow of h = Re(-i H) (RK4), shape (T, 4, N)."""
+    from xnf4d.distributions import _PolyEvaluator, _to_complex
+
+    ev = _PolyEvaluator([H])
+
+    def f(z):
+        g = np.zeros_like(z)
+        for k in range(4):
+            d = np.zeros((4, 1))
+            d[k] = 1e-6
+            g[k] = np.real(-1j * (ev(_to_complex(z + d))[0] - ev(_to_complex(z - d))[0])) / 2e-6
+        return np.array([g[1], -g[0], g[3], -g[2]])
+
+    z, out = z0.copy(), []
+    for k in range(int(t_end / dt)):
+        k1 = f(z)
+        k2 = f(z + dt / 2 * k1)
+        k3 = f(z + dt / 2 * k2)
+        k4 = f(z + dt * k3)
+        z = z + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+        if k % 10 == 0:
+            out.append(z.copy())
+    return np.array(out)
+
+
+class TestHamiltonianTori:
+    def test_nonresonant_tori_have_constant_actions(self):
+        nf = StubNormalForm(tori_hamiltonian([]))
+        ht = hamiltonian_tori(nf, TORI_Z0, num_points=4096)
+        assert isinstance(ht, HamiltonianTori) and ht.resonance is None
+        assert np.all(np.isnan(ht.invariant))
+        for i in range(ht.num_particles):
+            (t,) = ht.tori_nf[i]
+            assert t.shape[0] == 4 and 3500 < t.shape[1] * t.shape[2] < 4700
+            np.testing.assert_allclose(np.hypot(t[0], t[1]), np.hypot(*TORI_Z0[:2, i]), atol=1e-12)
+            np.testing.assert_allclose(np.hypot(t[2], t[3]), np.hypot(*TORI_Z0[2:, i]), atol=1e-12)
+            np.testing.assert_allclose(ht.tori_norm[i][0], t, atol=1e-12)  # Psi = identity
+
+    @pytest.mark.parametrize("extra, resonance", [(COUPLING, (1, -1)), (ISLANDS, (1, 0))])
+    def test_invariants_on_tori(self, extra, resonance):
+        nf = StubNormalForm(tori_hamiltonian(extra))
+        ht = hamiltonian_tori(nf, TORI_Z0, num_points=4096)
+        assert ht.resonance == resonance
+        n, m = resonance
+        for i in range(ht.num_particles):
+            pts = ht.points(i, "nf")
+            a1, a2 = pts[0] ** 2 + pts[1] ** 2, pts[2] ** 2 + pts[3] ** 2
+            np.testing.assert_allclose(m * a1 - n * a2, ht.invariant[i], atol=1e-10)
+            h = np.real(-1j * np.array(nf.H.substitute(*real_to_complex(*pts))))
+            np.testing.assert_allclose(h, ht.h0[i], rtol=1e-10, atol=1e-12)
+
+    @pytest.mark.parametrize("extra", [[], COUPLING, ISLANDS])
+    def test_flow_lies_on_tori(self, extra):
+        from scipy.spatial import cKDTree
+
+        H = tori_hamiltonian(extra)
+        ht = hamiltonian_tori(StubNormalForm(H), TORI_Z0, num_points=65536)
+        traj = flow_points(H, TORI_Z0)
+        for i in range(ht.num_particles):
+            r = np.linalg.norm(TORI_Z0[:, i])
+            spacing = 2 * 2 * np.pi * r / np.sqrt(65536)
+            d = cKDTree(ht.points(i).T).query(traj[:, :, i])[0]
+            assert d.max() < spacing
+
+    @pytest.mark.parametrize("y_amp", [1e-3, 1e-7, 0.0])
+    def test_small_amplitude_in_other_plane(self, y_amp):
+        """The reduced orbit is far smaller than the grid spacing of the full chart."""
+        from scipy.spatial import cKDTree
+
+        H = tori_hamiltonian(COUPLING)
+        z0 = np.array([[0.5], [0.0], [y_amp], [0.0]])
+        ht = hamiltonian_tori(StubNormalForm(H), z0, num_points=16384)
+        assert ht.tori_nf[0], "empty torus"
+        pts = ht.points(0, "nf")
+        np.testing.assert_allclose(pts[0] ** 2 + pts[1] ** 2 + pts[2] ** 2 + pts[3] ** 2,
+                                   0.25 + y_amp**2, rtol=1e-9)
+        traj = flow_points(H, z0, t_end=300.0)
+        d = cKDTree(pts.T).query(traj[:, :, 0])[0]
+        assert d.max() < 2 * 2 * np.pi * 0.5 / np.sqrt(16384)
+
+    def test_small_orbit_far_from_start_amplitude(self):
+        """Weak coupling: an orbit too small for the full grid, much larger than its start."""
+        from scipy.spatial import cKDTree
+
+        weak = [Term(1j * 2e-4, 1, 0, 0, 1), Term(1j * 2e-4, 0, 1, 1, 0)]
+        H = tori_hamiltonian(weak)
+        z0 = np.array([[1.0], [0.0], [1e-5], [0.0]])
+        ht = hamiltonian_tori(StubNormalForm(H), z0, num_points=16384)
+        traj = flow_points(H, z0, t_end=2000.0)
+        a2_flow = traj[:, 2, 0] ** 2 + traj[:, 3, 0] ** 2
+        pts = ht.points(0, "nf")
+        a2 = pts[2] ** 2 + pts[3] ** 2
+        # the orbit reaches far beyond the start amplitude, yet stays below the
+        # resolution of the full grid (spacing 2 / 400 in |zeta_y|)
+        assert 1e-6 < a2_flow.max() < (10 * 2 / 400) ** 2
+        assert a2_flow.max() > (4 * 1e-5) ** 2 * 10
+        np.testing.assert_allclose(a2.max(), a2_flow.max(), rtol=0.05)
+        d = cKDTree(pts.T).query(traj[:, :, 0])[0]
+        assert d.max() < 2 * 2 * np.pi / np.sqrt(16384)
+
+    def test_coupling_exchanges_energy(self):
+        ht = hamiltonian_tori(StubNormalForm(tori_hamiltonian(COUPLING)), TORI_Z0[:, :1])
+        pts = ht.points(0, "nf")
+        a1 = pts[0] ** 2 + pts[1] ** 2
+        # started in x with a small y amplitude, the torus reaches a large y action
+        assert a1.min() < 0.7 * a1.max()
+
+    def test_distance(self):
+        nf = StubNormalForm(tori_hamiltonian([]))
+        z0 = TORI_Z0[:, :2].copy()
+        z0[2:] = 0  # one plane each, as from track_orbits
+
+        def step(z):  # rotation of both planes: stays on the tori of constant actions
+            c, s = np.cos(0.3), np.sin(0.3)
+            return np.array([c * z[0] + s * z[1], -s * z[0] + c * z[1],
+                             c * z[2] + s * z[3], -s * z[2] + c * z[3]])
+
+        orbits = tracked_orbits_from(z0, 50, step)
+        ht = hamiltonian_tori(nf, orbits, num_points=4096)
+        d = ht.distance(orbits)
+        assert d.shape == (2, 50)
+        # one plane each: all the points go along the circle of the plane
+        assert np.nanmax(d) < 2 * np.pi * 3.1 / 4096
+        with pytest.raises(ValueError, match="initial conditions"):
+            hamiltonian_tori(nf, z0[:, ::-1] * 1.1).distance(orbits)
+        with pytest.raises(ValueError, match="coordinates"):
+            ht.points(0, "phys")
+
+    def test_select(self):
+        nf = StubNormalForm(tori_hamiltonian(COUPLING))
+        z0 = np.array([[1.0, 0.0, 2.0, 0.0], [0.0, 0.0, 0.0, 0.0],
+                       [0.0, 1.5, 0.0, 0.5], [0.0, 0.0, 0.0, 0.0]])
+
+        def step(z):
+            c, s = np.cos(0.3), np.sin(0.3)
+            return np.array([c * z[0] + s * z[1], -s * z[0] + c * z[1],
+                             c * z[2] + s * z[3], -s * z[2] + c * z[3]])
+
+        orbits = tracked_orbits_from(z0, 5, step)
+        ht = hamiltonian_tori(nf, orbits, num_points=1024)
+        np.testing.assert_array_equal(ht.plane, ["x", "y", "x", "y"])
+        for plane in ("x", "y"):
+            sel, osel = ht.select(plane), orbits.select(plane)
+            idx = np.flatnonzero(ht.plane == plane)
+            assert sel.num_particles == 2 and np.all(sel.plane == plane)
+            assert sel.resonance == ht.resonance
+            np.testing.assert_array_equal(sel.z0_norm, ht.z0_norm[:, idx])
+            np.testing.assert_array_equal(sel.h0, ht.h0[idx])
+            np.testing.assert_array_equal(sel.invariant, ht.invariant[idx])
+            for k, i in enumerate(idx):
+                assert sel.tori_norm[k] is ht.tori_norm[i]
+            # lines up with the selected orbits
+            assert sel.distance(osel).shape == (2, 5)
+        with pytest.raises(ValueError, match="plane"):
+            ht.select("z")
+
+    def test_double_resonance_rejected(self):
+        H = tori_hamiltonian(COUPLING + ISLANDS)
+        with pytest.raises(ValueError, match="double resonance"):
+            hamiltonian_tori(StubNormalForm(H), TORI_Z0)
+
+    def test_invalid(self):
+        nf = StubNormalForm(tori_hamiltonian([]))
+        with pytest.raises(ValueError, match="shape"):
+            hamiltonian_tori(nf, np.zeros((3, 2)))
+        with pytest.raises(ValueError, match="grid_size"):
+            hamiltonian_tori(nf, TORI_Z0, grid_size=2)
+        nf.H = None
+        with pytest.raises(ValueError, match="not been computed"):
+            hamiltonian_tori(nf, TORI_Z0)
+
+
+class TestStitchedTori:
+    def test_same_normal_form_matches_single(self):
+        nf = StubNormalForm(tori_hamiltonian(COUPLING))
+        single = hamiltonian_tori(nf, TORI_Z0, num_points=4096)
+        stitched = hamiltonian_tori([nf, nf, nf], TORI_Z0, num_points=4096, seams=[1.0, 2.0])
+        assert single.region is None and stitched.region is not None
+        rho = np.sqrt(np.sum(TORI_Z0**2, axis=0))  # Psi = identity
+        np.testing.assert_array_equal(stitched.region, np.searchsorted([1.0, 2.0], rho, side="right"))
+        np.testing.assert_array_equal(stitched.plane, single.plane)
+        np.testing.assert_allclose(stitched.h0, single.h0)
+        for a, b in zip(stitched.tori_norm, single.tori_norm):
+            assert len(a) == len(b)
+            for ta, tb in zip(a, b):
+                np.testing.assert_allclose(ta, tb)
+
+    def test_each_band_uses_its_normal_form(self):
+        inner = StubNormalForm(tori_hamiltonian(COUPLING))
+        outer = StubNormalForm(tori_hamiltonian(
+            [Term(1j * 0.02, 1, 0, 0, 1), Term(1j * 0.02, 0, 1, 1, 0)]))
+        ht = hamiltonian_tori([inner, outer], TORI_Z0, num_points=4096, seams=[1.5])
+        rho = np.sqrt(np.sum(TORI_Z0**2, axis=0))
+        np.testing.assert_array_equal(ht.region, (rho >= 1.5).astype(int))
+        for k, nf in enumerate((inner, outer)):
+            idx = np.flatnonzero(ht.region == k)
+            ref = hamiltonian_tori(nf, TORI_Z0[:, idx], num_points=4096)
+            for j, i in enumerate(idx):
+                np.testing.assert_allclose(ht.tori_nf[i][0], ref.tori_nf[j][0])
+                assert ht.h0[i] == pytest.approx(ref.h0[j])
+        # select keeps the region
+        sel = ht.select("y")
+        np.testing.assert_array_equal(sel.region, ht.region[ht.plane == "y"])
+
+    def test_normal_form_outside_its_range_not_used(self):
+        """An inner normal form that maps large amplitudes into its own band."""
+        inner = StubNormalForm(tori_hamiltonian(COUPLING))
+        scale = 0.4  # Psi shrinks amplitudes: a 7 sigma point appears at 2.8
+        inner.Psi = Map(*(Polynom([Term(scale, *(int(i == j) for i in range(4)))]) for j in range(4)))
+        inner.Phi = Map(*(Polynom([Term(1 / scale, *(int(i == j) for i in range(4)))]) for j in range(4)))
+        outer = StubNormalForm(tori_hamiltonian(COUPLING))
+        z0 = np.array([[1.0, 7.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
+        ht = hamiltonian_tori([inner, outer], z0, num_points=1024, seams=[3.5])
+        # 1 sigma: inside the inner band for both measures; 7 sigma: the outer one
+        np.testing.assert_array_equal(ht.region, [0, 1])
+
+    def test_different_resonances_rejected(self):
+        a = StubNormalForm(tori_hamiltonian(COUPLING))
+        b = StubNormalForm(tori_hamiltonian([]))
+        with pytest.raises(ValueError, match="different resonances"):
+            hamiltonian_tori([a, b], TORI_Z0, seams=[1.0])
+
+    @pytest.mark.parametrize("seams, match", [
+        ([1.0, 2.0], "seam radii"), (None, "seam radii"), ([-1.0], "positive"),
+    ])
+    def test_invalid_seams(self, seams, match):
+        nf = StubNormalForm(tori_hamiltonian([]))
+        with pytest.raises(ValueError, match=match):
+            hamiltonian_tori([nf, nf], TORI_Z0, seams=seams)
+
+    def test_seams_need_several_normal_forms(self):
+        with pytest.raises(ValueError, match="sequence"):
+            hamiltonian_tori(StubNormalForm(tori_hamiltonian([])), TORI_Z0, seams=[1.0])
