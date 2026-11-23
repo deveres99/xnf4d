@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 
 import numpy as np
 import pytest
@@ -8,13 +9,19 @@ import pytest
 xt = pytest.importorskip("xtrack")
 
 from xnf4d.distributions import (  # noqa: E402
+    _f_2D,
+    _f_4D,
+    _generate_factorizable,
+    _generate_nonfactorizable,
     _PolyEvaluator,
     _to_complex,
     _to_real,
     _Transforms,
     generate_2D_uniform_circular_sector,
     generate_matched_gaussian_bunch,
+    generate_matched_qgaussian_bunch,
     generate_pencil_on_collimator,
+    seam_mismatch,
 )
 from xnf4d.numerical_normal_form import NormalForm4D  # noqa: E402
 from xnf4d.one_turn_map import OneTurnMap4D  # noqa: E402
@@ -383,11 +390,12 @@ class TestCircularSector:
         with pytest.raises(ValueError):
             generate_2D_uniform_circular_sector(10, normal_form=linear_normal_form(), **kwargs)
 
-    def test_resonant_normal_form_rejected(self):
+    def test_resonant_normal_form_warns(self):
         nf = NormalForm4D(linear_normal_form().N, 2, "resonant", res_basis1=[4, 0])
         nf.compute_normal_form()
-        with pytest.raises(ValueError, match="non-resonant"):
-            generate_2D_uniform_circular_sector(10, normal_form=nf)
+        with pytest.warns(UserWarning, match="approximately matched"):
+            out = generate_2D_uniform_circular_sector(10, normal_form=nf)
+        assert out[0].shape == (10,)
 
 
 class TestGaussianBunch:
@@ -429,3 +437,349 @@ class TestGaussianBunch:
         with pytest.raises(ValueError):
             generate_matched_gaussian_bunch(10, NEMITT, NEMITT, 0.08, line=line2,
                                             normal_form=nf, at_element="coll", twiss=tw)
+
+
+# --------------------------------------------------------------------------- #
+# q-Gaussian helpers
+# --------------------------------------------------------------------------- #
+
+
+def q_gaussian_1d_cdf(q: float, beta: float):
+    """CDF of the 1D q-Gaussian e_q(-beta x^2) (a Student t), Gaussian for q = 1."""
+    stats = pytest.importorskip("scipy.stats")
+    if q == 1:
+        return stats.norm(scale=np.sqrt(1 / (2 * beta))).cdf
+    nu, s = (3 - q) / (q - 1), 1 / np.sqrt((3 - q) * beta)
+    return lambda x: stats.t.cdf(x / s, nu)
+
+
+def plane_radius_cdf(q: float, beta: float):
+    """CDF of the radius of the 2D q-Gaussian of _f_2D."""
+    if q == 1:
+        return lambda r: 1 - np.exp(-beta * r**2)
+    return lambda r: 1 - (1 + beta * (q - 1) * r**2) ** (-(3 - q) / (2 * (q - 1)))
+
+
+GENERATORS = [_generate_factorizable, _generate_nonfactorizable]
+
+
+class TestQGaussianHelpers:
+    @pytest.mark.parametrize("q", [1.2, 2.0, 2.8])
+    def test_densities_normalised(self, q):
+        from scipy.integrate import quad
+
+        beta = 0.7
+        n2 = quad(lambda r: 2 * np.pi * r * _f_2D(r, q, beta), 0, np.inf)[0]
+        n4 = quad(lambda m: 2 * np.pi**2 * m**3 * _f_4D(m, q, beta), 0, np.inf)[0]
+        assert n2 == pytest.approx(1, abs=1e-6)
+        assert n4 == pytest.approx(1, abs=1e-6)
+
+    @pytest.mark.parametrize("generate", GENERATORS)
+    @pytest.mark.parametrize("q", [1.0, 1.5, 2.5])
+    def test_marginals(self, generate, q):
+        from scipy.stats import kstest
+
+        beta = 0.8
+        w = generate(50_000, q, beta, np.random.default_rng(0))
+        assert w.shape == (4, 50_000)
+        for u in w:
+            assert kstest(u, q_gaussian_1d_cdf(q, beta)).statistic < 0.012
+        for r in (np.hypot(w[0], w[1]), np.hypot(w[2], w[3])):
+            assert kstest(r, plane_radius_cdf(q, beta)).statistic < 0.012
+
+    def test_unit_variance(self):
+        q = 1.2
+        for generate in GENERATORS:
+            w = generate(100_000, q, 1 / (5 - 3 * q), np.random.default_rng(1))
+            np.testing.assert_allclose(np.std(w, axis=1), 1.0, atol=0.02)
+
+    def test_planes_independent_only_if_factorisable(self):
+        from scipy.stats import spearmanr
+
+        rng = np.random.default_rng(2)
+        corr = {}
+        for generate in GENERATORS:
+            w = generate(50_000, 2.0, 1.0, rng)
+            corr[generate] = spearmanr(np.hypot(w[0], w[1]), np.hypot(w[2], w[3])).statistic
+        assert abs(corr[_generate_factorizable]) < 0.02
+        assert corr[_generate_nonfactorizable] > 0.5
+
+    def test_seed(self):
+        for generate in GENERATORS:
+            a = generate(10, 1.5, 1.0, np.random.default_rng(3))
+            b = generate(10, 1.5, 1.0, np.random.default_rng(3))
+            np.testing.assert_array_equal(a, b)
+
+    @pytest.mark.parametrize("q, beta", [(0.5, 1.0), (3.0, 1.0), (1.5, 0.0)])
+    def test_invalid_parameters(self, q, beta):
+        for generate in GENERATORS:
+            with pytest.raises(ValueError):
+                generate(10, q, beta, np.random.default_rng(0))
+
+
+# --------------------------------------------------------------------------- #
+# q-Gaussian bunch
+# --------------------------------------------------------------------------- #
+
+
+def qgaussian(setup, num_particles=4000, **kwargs):
+    line, tw, nf, _ = setup
+    args = dict(line=line, normal_form=nf, at_element="coll", twiss=tw, seed=0,
+                q=1.5, beta=1.0, fact=True)
+    args.update(kwargs)
+    p = generate_matched_qgaussian_bunch(num_particles, NEMITT, NEMITT, 0.08, **args)
+    n = tw.get_normalized_coordinates(p, nemitt_x=NEMITT, nemitt_y=NEMITT)
+    return p, np.array([n.x_norm, n.px_norm, n.y_norm, n.py_norm])
+
+
+class TestQGaussianBunch:
+    @pytest.mark.parametrize("fact", [True, False])
+    def test_linear_marginals(self, linear_setup, fact):
+        from scipy.stats import kstest
+
+        p, z = qgaussian(linear_setup, 20_000, fact=fact, q=1.4, beta=0.8)
+        assert len(p.x) == 20_000 and np.all(p.at_element == 0)
+        for u in z:
+            assert kstest(u, q_gaussian_1d_cdf(1.4, 0.8)).statistic < 0.015
+
+    @pytest.mark.parametrize("skew_cut", [True, False])
+    @pytest.mark.parametrize("fact", [True, False])
+    def test_cut(self, linear_setup, skew_cut, fact):
+        p, z = qgaussian(linear_setup, 3000, q=2.0, sigma_cut_x=3.0, sigma_cut_y=2.0,
+                         skew_cut=skew_cut, fact=fact)
+        rx, ry = np.hypot(z[0], z[1]), np.hypot(z[2], z[3])
+        assert len(p.x) == 3000
+        if skew_cut:
+            assert np.all(rx**2 / 9 + ry**2 / 4 < 1 + 1e-9)
+            # the corners of the rectangle are cut
+            assert not np.any((rx > 2.4) & (ry > 1.6))
+        else:
+            assert np.all((rx < 3 + 1e-9) & (ry < 2 + 1e-9))
+            assert np.any((rx > 2.4) & (ry > 1.6))
+        assert rx.max() > 2.8 and ry.max() > 1.8
+
+    def test_cut_in_one_plane(self, linear_setup):
+        _, z = qgaussian(linear_setup, 3000, q=2.0, sigma_cut_x=2.0)
+        rx, ry = np.hypot(z[0], z[1]), np.hypot(z[2], z[3])
+        assert np.all(rx < 2 + 1e-9) and ry.max() > 5
+
+    def test_nonlinear_normal_form_coordinates(self, octupole_setup):
+        from scipy.stats import kstest
+
+        nf = octupole_setup[2]
+        q, beta = 1.2, 1 / (5 - 3 * 1.2)
+        _, z = qgaussian(octupole_setup, 5000, q=q, beta=beta, sigma_cut_x=6.0, sigma_cut_y=6.0)
+        assert np.all(np.hypot(z[0], z[1]) ** 2 + np.hypot(z[2], z[3]) ** 2 < 36 + 1e-9)
+        w = _to_real(_Transforms(nf, "x").psi(_to_complex(z)))
+        # the cut at 6 sigma removes ~1e-3 of the q-Gaussian
+        assert kstest(np.hypot(w[0], w[1]), plane_radius_cdf(q, beta)).statistic < 0.03
+
+    def test_seed(self, linear_setup):
+        a, _ = qgaussian(linear_setup, 10, seed=5, sigma_cut_x=3.0)
+        b, _ = qgaussian(linear_setup, 10, seed=5, sigma_cut_x=3.0)
+        np.testing.assert_array_equal(a.x, b.x)
+
+    def test_cut_too_tight(self, linear_setup):
+        with pytest.raises(RuntimeError, match="too tight"):
+            qgaussian(linear_setup, 10, q=2.5, sigma_cut_x=1e-4, sigma_cut_y=1e-4)
+
+    @pytest.mark.parametrize(
+        "kwargs, error",
+        [
+            (dict(q=3.0), ValueError),
+            (dict(q=0.9), ValueError),
+            (dict(beta=0.0), ValueError),
+            (dict(sigma_cut_x=-1.0), ValueError),
+            (dict(sigma_cut_y=0.0), ValueError),
+            (dict(fact=1), TypeError),
+            (dict(skew_cut="yes"), TypeError),
+        ],
+    )
+    def test_invalid_arguments(self, linear_setup, kwargs, error):
+        with pytest.raises(error):
+            qgaussian(linear_setup, 10, **kwargs)
+
+
+# --------------------------------------------------------------------------- #
+# Resonant normal forms in the distributions
+# --------------------------------------------------------------------------- #
+
+
+def coupling_normal_form(qx: float = QX, qy: float = QY) -> NormalForm4D:
+    """Quasi-resonant normal form of the coupling resonance of a rotation."""
+    q = 0.5 * (qx + qy)
+    nf = NormalForm4D(linear_normal_form(qx, qy).N, 2, "quasiresonant",
+                      res_eig=[np.exp(2j * np.pi * q), np.exp(-2j * np.pi * q)] * 2,
+                      res_basis1=[1, -1])
+    nf.compute_normal_form()
+    return nf
+
+
+class TestResonantNormalForms:
+    def _bunch(self, setup, function, **kwargs):
+        line, tw, _, _ = setup
+        return function(200, NEMITT, NEMITT, 0.08, line=line, at_element="coll", twiss=tw,
+                        seed=0, **kwargs)
+
+    def test_gaussian_bunch_with_coupling_resonance(self, linear_setup):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            p = self._bunch(linear_setup, generate_matched_gaussian_bunch,
+                            normal_form=coupling_normal_form())
+        assert len(p.x) == 200
+
+    def test_qgaussian_with_coupling_resonance(self, linear_setup):
+        nf = coupling_normal_form()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            self._bunch(linear_setup, generate_matched_qgaussian_bunch, normal_form=nf,
+                        q=1.5, beta=1.0, fact=False)
+            # q = 1 is the Gaussian, a function of the sum of the actions
+            self._bunch(linear_setup, generate_matched_qgaussian_bunch, normal_form=nf,
+                        q=1.0, beta=0.5, fact=True)
+        with pytest.warns(UserWarning, match="approximately matched"):
+            self._bunch(linear_setup, generate_matched_qgaussian_bunch, normal_form=nf,
+                        q=1.5, beta=1.0, fact=True)
+
+    def test_gaussian_with_other_resonance_warns(self, linear_setup):
+        nf = NormalForm4D(linear_normal_form().N, 2, "resonant", res_basis1=[4, 0])
+        nf.compute_normal_form()
+        with pytest.warns(UserWarning, match="approximately matched"):
+            self._bunch(linear_setup, generate_matched_gaussian_bunch, normal_form=nf)
+
+    def test_double_resonance_rejected(self, linear_setup):
+        nf = NormalForm4D(linear_normal_form().N, 2, "resonant", res_basis1=[1, -1],
+                          res_basis2=[4, 0])
+        nf.compute_normal_form()
+        with pytest.raises(ValueError, match="two resonances"):
+            self._bunch(linear_setup, generate_matched_gaussian_bunch, normal_form=nf)
+
+    def test_pencil_still_needs_nonresonant(self, linear_setup):
+        with pytest.raises(ValueError, match="non-resonant"):
+            pencil(linear_setup, 10, normal_form=coupling_normal_form())
+
+
+# --------------------------------------------------------------------------- #
+# Seams between normal forms
+# --------------------------------------------------------------------------- #
+
+
+class TestSeamMismatch:
+    def test_same_normal_form_has_no_mismatch(self, octupole_setup):
+        nf = octupole_setup[2]
+        sm = seam_mismatch(nf, nf, [2.0, 3.0], num_points=300, seed=0)
+        assert sm.radii.tolist() == [2.0, 3.0]
+        for d in sm.inner_to_outer + sm.outer_to_inner:
+            assert d.size == 300
+            np.testing.assert_allclose(d, 0, atol=1e-9)
+        assert np.all(sm.failed == 0)
+
+    def test_different_normal_forms(self, octupole_setup):
+        tw = octupole_setup[1]
+        lin = linear_normal_form(tw.qx % 1, tw.qy % 1)
+        sm = seam_mismatch(lin, octupole_setup[2], [1.0, 4.0], num_points=300, seed=0)
+        rms = sm.summary()["rms"]
+        assert 0 < rms[0] < rms[1]  # the non-linear distortion grows with amplitude
+        assert sm.best_radius == 1.0
+        summary = sm.summary()
+        for key in ("inner_to_outer_mean", "inner_to_outer_rms", "inner_to_outer_max",
+                    "outer_to_inner_mean", "outer_to_inner_rms", "outer_to_inner_max", "rms"):
+            assert summary[key].shape == (2,)
+
+    def test_coupling_resonance_accepted(self):
+        nf = coupling_normal_form()
+        sm = seam_mismatch(nf, linear_normal_form(), 2.0, num_points=50, seed=0)
+        np.testing.assert_allclose(sm.inner_to_outer[0], 0, atol=1e-9)
+
+    def test_other_resonance_rejected(self):
+        nf = NormalForm4D(linear_normal_form().N, 2, "resonant", res_basis1=[4, 0])
+        nf.compute_normal_form()
+        with pytest.raises(ValueError, match="not invariant"):
+            seam_mismatch(nf, linear_normal_form(), 2.0)
+
+    def test_invalid(self):
+        nf = linear_normal_form()
+        with pytest.raises(ValueError, match="radii"):
+            seam_mismatch(nf, nf, [-1.0])
+        with pytest.raises(ValueError, match="num_points"):
+            seam_mismatch(nf, nf, 1.0, num_points=0)
+        with pytest.raises(ValueError, match="not been computed"):
+            seam_mismatch(NormalForm4D(nf.N, 2), nf, 1.0)
+
+
+# --------------------------------------------------------------------------- #
+# Stitched normal forms
+# --------------------------------------------------------------------------- #
+
+
+class TestStitchedBunch:
+    def _normalised(self, setup, function, **kwargs):
+        line, tw, _, _ = setup
+        p = function(3000, NEMITT, NEMITT, 0.08, line=line, at_element="coll", twiss=tw,
+                     seed=4, **kwargs)
+        n = tw.get_normalized_coordinates(p, nemitt_x=NEMITT, nemitt_y=NEMITT)
+        return np.array([n.x_norm, n.px_norm, n.y_norm, n.py_norm])
+
+    def test_same_normal_form_is_unchanged(self, octupole_setup):
+        nf = octupole_setup[2]
+        single = self._normalised(octupole_setup, generate_matched_gaussian_bunch, normal_form=nf)
+        stitched = self._normalised(octupole_setup, generate_matched_gaussian_bunch,
+                                    normal_form=[nf, nf, nf], seams=[1.0, 2.0])
+        np.testing.assert_array_equal(single, stitched)
+
+    @pytest.mark.parametrize("function, kwargs", [
+        (generate_matched_gaussian_bunch, {}),
+        (generate_matched_qgaussian_bunch, dict(q=1.5, beta=1.0, fact=False, sigma_cut_x=6.0)),
+    ])
+    def test_points_follow_their_normal_form(self, octupole_setup, function, kwargs):
+        tw, nf = octupole_setup[1], octupole_setup[2]
+        lin = linear_normal_form(tw.qx % 1, tw.qy % 1)
+        seam = 2.0
+        z = self._normalised(octupole_setup, function, normal_form=[lin, nf], seams=[seam], **kwargs)
+        rho_in = np.sqrt(np.sum(z**2, axis=0))  # linear normal form: Psi = identity
+        w = _to_real(_Transforms(nf, "x").psi(_to_complex(z)))
+        rho_out = np.sqrt(np.sum(w**2, axis=0))
+        inner, outer = rho_in < seam - 1e-6, rho_out >= seam - 1e-6
+        # every point comes from the normal form of its side of the seam
+        assert np.all(inner | outer)
+        assert inner.sum() > 100 and (~inner).sum() > 100
+
+    @pytest.mark.parametrize("kwargs, match", [
+        (dict(seams=[2.0]), "sequence"),
+        (dict(normal_form="pair", seams=[2.0, 3.0]), "seam radii"),
+        (dict(normal_form="pair", seams=None), "seam radii"),
+        (dict(normal_form="pair", seams=[-1.0]), "positive and increasing"),
+        (dict(normal_form="five", seams=[1.0, 2.0, 3.0, 4.0]), "Between 2 and 4"),
+    ])
+    def test_invalid_seams(self, octupole_setup, kwargs, match):
+        nf = octupole_setup[2]
+        forms = {"pair": [nf, nf], "five": [nf] * 5}
+        kwargs = dict(kwargs)
+        kwargs["normal_form"] = forms.get(kwargs.get("normal_form"), nf)
+        with pytest.raises(ValueError, match=match):
+            self._normalised(octupole_setup, generate_matched_gaussian_bunch, **kwargs)
+
+    def test_decreasing_seams_rejected(self, octupole_setup):
+        nf = octupole_setup[2]
+        with pytest.raises(ValueError, match="increasing"):
+            self._normalised(octupole_setup, generate_matched_gaussian_bunch,
+                             normal_form=[nf, nf, nf], seams=[3.0, 2.0])
+
+    def test_factorisable_cannot_be_stitched(self, octupole_setup):
+        nf = octupole_setup[2]
+        with pytest.raises(ValueError, match="joined"):
+            self._normalised(octupole_setup, generate_matched_qgaussian_bunch,
+                             normal_form=[nf, nf], seams=[2.0], q=1.5, beta=1.0, fact=True)
+
+    def test_resonance_without_common_invariant_rejected(self, octupole_setup):
+        nf4 = NormalForm4D(linear_normal_form().N, 2, "resonant", res_basis1=[4, 0])
+        nf4.compute_normal_form()
+        with pytest.raises(ValueError, match="not invariant"):
+            self._normalised(octupole_setup, generate_matched_gaussian_bunch,
+                             normal_form=[octupole_setup[2], nf4], seams=[2.0])
+
+    def test_coupling_normal_forms_can_be_stitched(self, linear_setup):
+        nf = coupling_normal_form()
+        z = self._normalised(linear_setup, generate_matched_gaussian_bunch,
+                             normal_form=[nf, linear_normal_form()], seams=[1.5])
+        assert z.shape == (4, 3000)

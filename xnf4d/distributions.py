@@ -65,17 +65,34 @@ coordinates ``zeta``, and map them to normalised coordinates by solving
 normal form actions ``|zeta1|^2, |zeta2|^2`` is invariant under the one-turn
 map of a non-resonant normal form, so a Gaussian bunch or a full ring is
 non-linearly matched. For a linear map they are the ``xpart`` distributions.
+:func:`generate_matched_qgaussian_bunch` does the same with q-Gaussians,
+factorisable (independent planes) or not (a function of the 4D radius),
+optionally cut in normalised coordinates.
+
+Joining normal forms
+--------------------
+A single polynomial map, hence a single normal form, may not be accurate
+over the whole amplitude range of a distribution (e.g. with beam-beam, whose
+kick is far from polynomial). The bunch functions therefore accept several
+normal forms (e.g. from maps fitted on different amplitude ranges, see
+``OneTurnMap4D(..., sigma_min=...)``) joined at seams of constant
+``|zeta1|^2 + |zeta2|^2``: a level set of an invariant of all of them (if
+non-resonant or with the coupling resonance), hence a set of tori of each.
+Each part of the distribution then depends on the invariants of its normal
+form; the remaining error, a thin layer at each seam where the two normal
+forms disagree, is measured by :func:`seam_mismatch`.
 """
 
 from __future__ import annotations
 
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import numpy as np
+from numpy.typing import ArrayLike
 from scipy.special import gamma
-from scipy.integrate import cumulative_trapezoid
 
 from .numerical_normal_form import NormalForm4D, complex_to_real, real_to_complex
 from .polynom import Polynom
@@ -83,7 +100,10 @@ from .polynom import Polynom
 __all__ = [
     "generate_2D_uniform_circular_sector",
     "generate_matched_gaussian_bunch",
+    "generate_matched_qgaussian_bunch",
     "generate_pencil_on_collimator",
+    "SeamMismatch",
+    "seam_mismatch",
 ]
 
 #: Number of grid points of each refinement step of the tangent search.
@@ -102,6 +122,15 @@ _CHUNK = 1000
 #: Accuracy of the inversion of Psi for distributions sampled in normal form
 #: coordinates [beam sizes].
 _TOL_INVERSE = 1e-9
+#: Points sampled in normal form coordinates beyond this multiple of a cut
+#: are discarded without inverting Psi.
+_CUT_MARGIN = 2.0
+#: Largest number of points sampled at once in normal form coordinates.
+_MAX_BATCH = 200_000
+#: Points sampled per requested point before a cut is deemed too tight.
+_MAX_TRIES = 1000
+#: Largest number of seams joining normal forms in one distribution.
+_MAX_SEAMS = 3
 
 
 # --------------------------------------------------------------------------- #
@@ -738,7 +767,11 @@ def _pencil_one_jaw(
 
 
 def _from_normal_form(
-    normal_form: NormalForm4D, num_particles: int, sample: Any
+    normal_form: NormalForm4D | Sequence[NormalForm4D],
+    num_particles: int,
+    sample: Callable[[int], np.ndarray],
+    cut: Callable[[np.ndarray, float], np.ndarray] | None = None,
+    seams: Sequence[float] | None = None,
 ) -> np.ndarray:
     """
     Normalised coordinates of points sampled in normal form coordinates.
@@ -750,30 +783,75 @@ def _from_normal_form(
     this fails (where the normal form is not valid) are discarded with a
     warning and replaced by new samples.
 
+    With a ``cut``, only points within the cut in normalised coordinates are
+    kept, and new samples are drawn until there are ``num_particles`` of
+    them. Points beyond the cut enlarged by ``_CUT_MARGIN`` in normal form
+    coordinates are discarded without inverting ``Psi``: as long as the
+    normal form is valid, ``Psi`` changes the amplitudes much less than that.
+    Failed inversions are reported only for points within the cut in normal
+    form coordinates (the others would most likely be cut).
+
+    With several normal forms joined by ``seams``, a point with normal form
+    amplitude ``rho = sqrt(|zeta1|^2 + |zeta2|^2)`` between ``seams[k - 1]``
+    and ``seams[k]`` is mapped with the inverse of ``Psi`` of
+    ``normal_form[k]`` (see :func:`seam_mismatch`).
+
     Parameters
     ----------
-    normal_form : NormalForm4D
-        Computed non-resonant normal form.
+    normal_form : NormalForm4D or sequence of NormalForm4D
+        Computed normal form(s), from the innermost.
     num_particles : int
         Number of points.
     sample : callable
         ``sample(m)`` returns ``m`` points ``w``, shape ``(4, m)``.
+    cut : callable, optional
+        ``cut(u, scale)`` returns whether the points ``u``, shape ``(4, m)``,
+        lie within the cut with its limits multiplied by ``scale``.
+    seams : sequence of float, optional
+        Increasing seam radii [beam sizes], one fewer than the normal forms.
 
     Returns
     -------
     numpy.ndarray, shape (4, num_particles)
         Normalised coordinates.
+
+    Raises
+    ------
+    RuntimeError
+        If almost no sampled point lies within the cut.
     """
-    transforms = _Transforms(normal_form, "x")
-    accepted, n_acc, n_tried = [], 0, 0
+    forms = [normal_form] if isinstance(normal_form, NormalForm4D) or not isinstance(
+        normal_form, Sequence) else list(normal_form)
+    transforms = [_Transforms(nf, "x") for nf in forms]
+    seams = np.asarray([] if seams is None else seams, dtype=float)
+    accepted, n_acc, n_tried, n_failed = [], 0, 0, 0
     while n_acc < num_particles:
-        m = num_particles - n_acc if n_tried == 0 else max(64, 2 * (num_particles - n_acc))
-        z = transforms.psi_inverse(_to_complex(sample(m)), _TOL_INVERSE)
-        ok = np.all(np.isfinite(z), axis=0)
+        missing = num_particles - n_acc
+        rate = max(n_acc, 1) / n_tried if n_tried else 1.0
+        m = int(min(max(64, 1.2 * missing / rate), _MAX_BATCH)) if n_tried else missing
+        w = sample(m)
+        if cut is None:
+            candidate = inside = np.ones(m, dtype=bool)
+        else:
+            candidate, inside = cut(w, _CUT_MARGIN), cut(w, 1.0)
+        z = np.full((4, m), np.nan)
+        # normal form of each point, from its normal form amplitude
+        region = np.searchsorted(seams, np.sqrt(np.sum(w**2, axis=0)), side="right")
+        for k, transform in enumerate(transforms):
+            sel = candidate & (region == k)
+            if sel.any():
+                z[:, sel] = transform.psi_inverse(_to_complex(w[:, sel]), _TOL_INVERSE)
+        finite = np.all(np.isfinite(z), axis=0)
+        n_failed += int(np.sum(candidate & inside & ~finite))
+        ok = finite if cut is None else finite & cut(np.where(finite, z, 0.0), 1.0)
         accepted.append(z[:, ok])
         n_acc += int(ok.sum())
         n_tried += m
-    n_failed = n_tried - n_acc
+        if n_acc < num_particles and n_tried > _MAX_TRIES * num_particles + 1_000_000:
+            raise RuntimeError(
+                f"Only {n_acc} of {n_tried} sampled points lie within the cut; "
+                "the cut is too tight for the distribution."
+            )
     if n_failed:
         warnings.warn(
             f"For {n_failed} of {n_tried} sampled points the normal form "
@@ -784,33 +862,435 @@ def _from_normal_form(
     return np.concatenate(accepted, axis=1)[:, :num_particles]
 
 
+def _normalised_cut(
+    sigma_cut_x: float | None, sigma_cut_y: float | None, skew_cut: bool
+) -> Callable[[np.ndarray, float], np.ndarray] | None:
+    """
+    Cut on the radii of the two planes in normalised phase space.
+
+    With ``r_x = hypot(x, px)`` and ``r_y = hypot(y, py)``, the points kept
+    are those with ``r_x^2 / sigma_cut_x^2 + r_y^2 / sigma_cut_y^2 < 1``
+    (``skew_cut``, as by a skew collimator) or ``r_x < sigma_cut_x`` and
+    ``r_y < sigma_cut_y``. A missing limit is infinite (no cut in that plane).
+
+    Parameters
+    ----------
+    sigma_cut_x, sigma_cut_y : float or None
+        Limits [beam sizes], positive.
+    skew_cut : bool
+        Elliptical cut in ``(r_x, r_y)`` if True, rectangular otherwise.
+
+    Returns
+    -------
+    callable or None
+        ``cut(u, scale)``, whether the points ``u``, shape ``(4, m)``, lie
+        within the cut with the limits multiplied by ``scale``; None if both
+        limits are missing.
+
+    Raises
+    ------
+    ValueError
+        If a limit is not positive.
+    """
+    for name, value in (("sigma_cut_x", sigma_cut_x), ("sigma_cut_y", sigma_cut_y)):
+        if value is not None and not value > 0:
+            raise ValueError(f"{name} must be positive, got {value}.")
+    if sigma_cut_x is None and sigma_cut_y is None:
+        return None
+    lim_x = np.inf if sigma_cut_x is None else float(sigma_cut_x)
+    lim_y = np.inf if sigma_cut_y is None else float(sigma_cut_y)
+
+    def cut(u: np.ndarray, scale: float) -> np.ndarray:
+        a = np.hypot(u[0], u[1]) / (scale * lim_x)
+        b = np.hypot(u[2], u[3]) / (scale * lim_y)
+        return a * a + b * b < 1 if skew_cut else (a < 1) & (b < 1)
+
+    return cut
+
+
+# --------------------------------------------------------------------------- #
+# q-Gaussian helpers
+# --------------------------------------------------------------------------- #
+
+
+def _f_2D(r: ArrayLike, q: float, beta: float) -> np.ndarray:
+    """
+    Density of the 2D q-Gaussian as a function of the radius.
+
+    The radially symmetric density in the plane ``(u, pu)``
+
+        f(r) = C_2 (1 + beta (q - 1) r^2)^(-(q + 1) / (2 (q - 1))),
+        C_2 = beta (3 - q) / (2 pi),
+
+    with ``r^2 = u^2 + pu^2``, normalised to 1 over the plane. The exponent is
+    chosen such that the 1D marginal of each coordinate is the 1D q-Gaussian
+    ``e_q(-beta u^2) ~ (1 + beta (q - 1) u^2)^(-1 / (q - 1))``, of variance
+    ``1 / (beta (5 - 3 q))`` (finite for ``q < 5/3``). It is a bivariate
+    Student t distribution with ``(3 - q) / (q - 1)`` degrees of freedom.
+
+    Parameters
+    ----------
+    r : array_like
+        Radius.
+    q : float
+        Parameter ``q``, ``1 < q < 3`` (the formula cannot evaluate the
+        Gaussian limit ``q = 1``).
+    beta : float
+        Scale parameter, positive.
+
+    Returns
+    -------
+    numpy.ndarray
+        Density at ``r`` (per unit area).
+    """
+
+    C_2 = (beta * (3 - q)) / (2 * np.pi)
+
+    return C_2 * (1 + beta * (q - 1) * r**2)**((q + 1) / (2 - 2*q))
+
+
+def _f_4D(m: ArrayLike, q: float, beta: float) -> np.ndarray:
+    """
+    Density of the 4D q-Gaussian as a function of the 4D radius.
+
+    The spherically symmetric density in ``(x, px, y, py)``
+
+        f(m) = C_4 (1 + beta (q - 1) m^2)^(-(3 q - 1) / (2 (q - 1))),
+        C_4 = beta^2 (3 - q) (q + 1) / (4 pi^2),
+
+    with ``m^2 = x^2 + px^2 + y^2 + py^2``, normalised to 1 over the 4D space.
+    It does not factorise into a product of densities of the two planes. The
+    exponent is chosen such that the 1D marginal of each coordinate is the
+    same 1D q-Gaussian as for :func:`_f_2D` (and the 2D marginal of each plane
+    is :func:`_f_2D`). It is a 4D Student t distribution with
+    ``(3 - q) / (q - 1)`` degrees of freedom.
+
+    Parameters
+    ----------
+    m : array_like
+        4D radius.
+    q : float
+        Parameter ``q``, ``1 < q < 3``.
+    beta : float
+        Scale parameter, positive.
+
+    Returns
+    -------
+    numpy.ndarray
+        Density at ``m`` (per unit 4D volume).
+    """
+
+    C_4 = (beta**2 * (3 - q) * (q + 1)) / (4 * np.pi**2)
+
+    return C_4 * (1 + beta * (q - 1) * m**2)**((3*q - 1) / (2 - 2*q))
+
+
+def _check_q_parameters(q: float, beta: float) -> None:
+    """
+    Check the parameters of the q-Gaussians.
+
+    Parameters
+    ----------
+    q : float
+        Parameter ``q``, ``1 <= q < 3``.
+    beta : float
+        Scale parameter, positive.
+
+    Raises
+    ------
+    ValueError
+        If ``q`` or ``beta`` is out of range.
+    """
+    if not 1 <= q < 3:
+        raise ValueError(f"q must satisfy 1 <= q < 3, got {q}.")
+    if not beta > 0:
+        raise ValueError(f"beta must be positive, got {beta}.")
+
+
+def _q_gaussian_vectors(
+    num_particles: int, dim: int, q: float, beta: float, rng: np.random.Generator
+) -> np.ndarray:
+    """
+    Sample the radially symmetric q-Gaussian in 2 or 4 dimensions.
+
+    The densities :func:`_f_2D` (``dim = 2``) and :func:`_f_4D` (``dim = 4``)
+    are multivariate Student t distributions with ``nu = (3 - q) / (q - 1)``
+    degrees of freedom and scale ``s = 1 / sqrt((3 - q) beta)``, so they are
+    sampled exactly (without truncation) as
+
+        w = s z / sqrt(g / nu),
+
+    with ``z`` a standard Gaussian vector and ``g`` an independent chi-squared
+    variable with ``nu`` degrees of freedom. For ``q = 1`` (``nu`` infinite)
+    this is the Gaussian of variance ``1 / (2 beta)``, the limit of the
+    q-Gaussian.
+
+    Parameters
+    ----------
+    num_particles : int
+        Number of points.
+    dim : {2, 4}
+        Dimension.
+    q : float
+        Parameter ``q``, ``1 <= q < 3``. The tails fall as ``r^(-(3 - q) /
+        (q - 1))`` (probability beyond ``r``), very slowly as ``q`` approaches
+        3.
+    beta : float
+        Scale parameter, positive.
+    rng : numpy.random.Generator
+        Random generator.
+
+    Returns
+    -------
+    numpy.ndarray, shape (dim, num_particles)
+        Coordinates.
+
+    Raises
+    ------
+    ValueError
+        If ``q`` or ``beta`` is out of range.
+    """
+    _check_q_parameters(q, beta)
+    z = rng.normal(size=(dim, num_particles))
+    if q == 1:
+        return z * np.sqrt(1 / (2 * beta))
+    nu = (3 - q) / (q - 1)
+    g = rng.chisquare(nu, size=num_particles)
+    return z * np.sqrt(nu / ((3 - q) * beta * g))
+
+
+def _generate_nonfactorizable(
+    num_particles: int, q: float, beta: float, rng: np.random.Generator
+) -> np.ndarray:
+    """
+    Sample the non-factorisable 4D q-Gaussian.
+
+    Points with the density :func:`_f_4D`, which depends only on the 4D
+    radius ``m``: isotropic in the 4D space, but not uniform, and the two
+    planes are not independent. Taken as normal form coordinates,
+    ``m^2 = |zeta1|^2 + |zeta2|^2`` is a function of the normal form actions,
+    so the distribution is invariant under the one-turn map of a
+    non-resonant normal form, and of one with a coupling resonance
+    (``(1, -1)``, which keeps ``|zeta1|^2 + |zeta2|^2`` invariant).
+
+    Parameters
+    ----------
+    num_particles : int
+        Number of points.
+    q : float
+        Parameter ``q``, ``1 <= q < 3``.
+    beta : float
+        Scale parameter, positive.
+    rng : numpy.random.Generator
+        Random generator.
+
+    Returns
+    -------
+    numpy.ndarray, shape (4, num_particles)
+        Coordinates ``(x, px, y, py)``.
+    """
+    return _q_gaussian_vectors(num_particles, 4, q, beta, rng)
+
+
+def _generate_factorizable(
+    num_particles: int, q: float, beta: float, rng: np.random.Generator
+) -> np.ndarray:
+    """
+    Sample the factorisable 4D q-Gaussian.
+
+    Points with the density ``f(r_x) f(r_y)`` of :func:`_f_2D`, the product
+    of independent 2D q-Gaussians of the two planes. Taken as normal form
+    coordinates, ``r_x = |zeta1|`` and ``r_y = |zeta2|``, so the distribution
+    is invariant under the one-turn map of a non-resonant normal form (not
+    under one with a resonance, which exchanges ``r_x`` and ``r_y``).
+
+    Parameters
+    ----------
+    num_particles : int
+        Number of points.
+    q : float
+        Parameter ``q``, ``1 <= q < 3``.
+    beta : float
+        Scale parameter, positive.
+    rng : numpy.random.Generator
+        Random generator.
+
+    Returns
+    -------
+    numpy.ndarray, shape (4, num_particles)
+        Coordinates ``(x, px, y, py)``.
+    """
+    return np.concatenate([
+        _q_gaussian_vectors(num_particles, 2, q, beta, rng),
+        _q_gaussian_vectors(num_particles, 2, q, beta, rng),
+    ])
+
+
 # --------------------------------------------------------------------------- #
 # Checks, longitudinal coordinates and particles
 # --------------------------------------------------------------------------- #
 
 
-def _check_normal_form(normal_form: NormalForm4D) -> None:
+def _normal_form_resonance(normal_form: NormalForm4D) -> tuple[int, int] | None:
     """
-    Check that a normal form is computed and non-resonant.
+    Resonance kept in a normal form.
+
+    Parameters
+    ----------
+    normal_form : NormalForm4D
+        Computed normal form.
+
+    Returns
+    -------
+    tuple of 2 int or None
+        Primitive resonance vector ``(n, m)`` (``n Qx + m Qy = p``), or None
+        for a non-resonant normal form.
+
+    Raises
+    ------
+    ValueError
+        For a normal form with two resonances.
+    """
+    case = getattr(normal_form, "res_case", None)
+    if case is None:  # not a NormalForm4D: read the resonance from H
+        from .orbits import _resonance_of
+
+        return _resonance_of(normal_form.H)
+    if case == "nonresonant":
+        return None
+    if getattr(normal_form, "res_space_dim", 1) > 1:
+        raise ValueError(
+            "Normal forms with two resonances are not supported: only h is "
+            "invariant, and no distribution of a beam can be built from it."
+        )
+    n, m = int(normal_form.res_basis1[0]), int(normal_form.res_basis2[0])
+    g = np.gcd(abs(n), abs(m))
+    n, m = n // g, m // g
+    if n < 0 or (n == 0 and m < 0):
+        n, m = -n, -m
+    return n, m
+
+
+def _check_normal_form(
+    normal_form: NormalForm4D,
+    density: Literal["sum", "other"] | None,
+    what: str,
+) -> None:
+    """
+    Check that a normal form is computed and suits a distribution.
+
+    A distribution is invariant under the one-turn map in normal form if its
+    density depends only on the invariants. For a non-resonant normal form
+    these are the actions ``A1 = |zeta1|^2`` and ``A2 = |zeta2|^2``. With one
+    resonance ``(n, m)`` they are ``h`` and ``m A1 - n A2``: a density
+    depending on ``A1 + A2`` only (``density="sum"``) is invariant for the
+    coupling resonances (``n + m = 0``); otherwise the distribution is only
+    approximately matched, and a warning is issued.
 
     Parameters
     ----------
     normal_form : NormalForm4D
         Normal form.
+    density : {"sum", "other"} or None
+        How the density depends on the actions: through ``A1 + A2`` only, or
+        otherwise; None if the distribution requires a non-resonant normal
+        form.
+    what : str
+        Name of the distribution, for the messages.
 
     Raises
     ------
     ValueError
-        If the normal form is not computed or not non-resonant.
+        If the normal form is not computed, has two resonances, or is
+        resonant when ``density`` is None.
+
+    Warns
+    -----
+    UserWarning
+        If the distribution is not exactly invariant under a resonant normal
+        form.
     """
     if normal_form.Psi is None:
         raise ValueError("The normal form has not been computed.")
-    if normal_form.res_case != "nonresonant":
+    resonance = _normal_form_resonance(normal_form)
+    if resonance is None:
+        return
+    n, m = resonance
+    if density is None:
         raise ValueError(
-            "The distribution is defined by the normal form actions, which are "
-            "invariant only for a non-resonant normal form; got "
-            f"res_case={normal_form.res_case!r}."
+            f"The {what} needs a non-resonant normal form (its invariant tori "
+            f"are those of constant actions); got the resonance ({n}, {m})."
         )
+    if density == "sum" and n + m == 0:
+        return
+    warnings.warn(
+        f"With the resonance ({n}, {m}) the invariants of the normal form are h "
+        f"and {m} A1 - {n} A2 (A = |zeta|^2); the density of the {what} is not a "
+        "function of them, so it is only approximately matched.",
+        stacklevel=3,
+    )
+
+
+def _normal_forms_and_seams(
+    normal_form: NormalForm4D | Sequence[NormalForm4D],
+    seams: Sequence[float] | None,
+    density: Literal["sum", "other"],
+    what: str,
+) -> tuple[list[NormalForm4D], np.ndarray]:
+    """
+    Check one normal form, or several joined by seams.
+
+    Parameters
+    ----------
+    normal_form : NormalForm4D or sequence of NormalForm4D
+        Normal form, or normal forms from the innermost.
+    seams : sequence of float or None
+        Seam radii (one fewer than the normal forms), or None for one normal
+        form.
+    density : {"sum", "other"}
+        How the density depends on the actions (see
+        :func:`_check_normal_form`).
+    what : str
+        Name of the distribution, for the messages.
+
+    Returns
+    -------
+    normal_forms : list of NormalForm4D
+        The normal forms.
+    seams : numpy.ndarray
+        The seam radii (empty for one normal form).
+
+    Raises
+    ------
+    ValueError
+        If the normal forms or seams are invalid, or the density is not a
+        function of ``|zeta1|^2 + |zeta2|^2`` with several normal forms.
+    """
+    if isinstance(normal_form, NormalForm4D) or not isinstance(normal_form, Sequence):
+        if seams is not None and len(seams) > 0:
+            raise ValueError("seams require a sequence of normal forms.")
+        _check_normal_form(normal_form, density, what)
+        return [normal_form], np.empty(0)
+    forms = list(normal_form)
+    seams = np.asarray([] if seams is None else seams, dtype=float)
+    if not 1 <= len(forms) - 1 <= _MAX_SEAMS:
+        raise ValueError(
+            f"Between 2 and {_MAX_SEAMS + 1} normal forms can be joined, got {len(forms)}."
+        )
+    if seams.ndim != 1 or seams.size != len(forms) - 1:
+        raise ValueError(
+            f"{len(forms)} normal forms need {len(forms) - 1} seam radii, got {seams.tolist()}."
+        )
+    if np.any(seams <= 0) or np.any(np.diff(seams) <= 0):
+        raise ValueError(f"The seam radii must be positive and increasing, got {seams.tolist()}.")
+    if density != "sum":
+        raise ValueError(
+            f"Normal forms can only be joined for a density depending on "
+            f"|zeta1|^2 + |zeta2|^2 alone, which the {what} is not."
+        )
+    for k, nf in enumerate(forms):
+        _seam_invariant_check(nf, f"normal_form[{k}]")
+    return forms, seams
 
 
 def _longitudinal_coordinates(
@@ -865,6 +1345,70 @@ def _longitudinal_coordinates(
         "longitudinal must be None, 'bucket', a dict with 'zeta' and 'delta' "
         "or a pair (zeta, delta)."
     )
+
+
+def _matched_bunch(
+    num_particles: int,
+    nemitt_x: float,
+    nemitt_y: float,
+    sigma_z: float,
+    line: Any,
+    normal_form: NormalForm4D,
+    at_element: str,
+    sample: Callable[[int], np.ndarray],
+    cut: Callable[[np.ndarray, float], np.ndarray] | None,
+    total_intensity_particles: float | None,
+    engine: str | None,
+    return_matcher: bool,
+    twiss: Any,
+    density: Literal["sum", "other"],
+    what: str,
+    seams: Sequence[float] | None = None,
+    **kwargs: Any,
+) -> Any:
+    """
+    Bunch with transverse coordinates sampled in normal form coordinates.
+
+    Shared by :func:`generate_matched_gaussian_bunch` and
+    :func:`generate_matched_qgaussian_bunch` (see there for the arguments).
+    The longitudinal coordinates are a Gaussian bunch matched to the bucket
+    (``xpart.generate_longitudinal_coordinates``), the transverse ones are
+    those of :func:`_from_normal_form` with ``sample`` and ``cut``.
+    ``density`` and ``what`` describe the transverse density for
+    :func:`_check_normal_form`; ``normal_form`` can be a sequence of normal
+    forms joined by ``seams`` (see :func:`_normal_forms_and_seams`).
+
+    Returns
+    -------
+    particles : xtrack.Particles
+        The bunch at ``at_element``.
+    matcher : object
+        Longitudinal matcher, only if ``return_matcher`` is True.
+
+    Raises
+    ------
+    ValueError
+        If the tracker is not built, or the normal form is not computed or
+        has two resonances.
+    """
+    import xpart as xp
+
+    forms, seams = _normal_forms_and_seams(normal_form, seams, density, what)
+    if not line._has_valid_tracker():
+        raise ValueError("Please build the tracker of the line first.")
+    num_particles = int(num_particles)
+    if twiss is None:
+        twiss = line.twiss()
+    zeta, delta, matcher = xp.generate_longitudinal_coordinates(
+        distribution="gaussian", num_particles=num_particles, line=line,
+        sigma_z=sigma_z, engine=engine, return_matcher=True,
+    )
+    z = _from_normal_form(forms, num_particles, sample, cut, seams)
+    if total_intensity_particles is None:
+        total_intensity_particles = num_particles
+    part = _build_particles(line, twiss, at_element, z, zeta, delta, nemitt_x, nemitt_y,
+                            weight=total_intensity_particles / num_particles, **kwargs)
+    return (part, matcher) if return_matcher else part
 
 
 def _build_particles(
@@ -1032,7 +1576,7 @@ def generate_pencil_on_collimator(
     del longitudinal_betatron_cut  # unused, as in xcoll
     if not line._has_valid_tracker():
         raise ValueError("Please build tracker before generating pencil distribution!")
-    _check_normal_form(normal_form)
+    _check_normal_form(normal_form, None, "pencil")
     if plane not in ("x", "y"):
         raise ValueError(f"plane must be 'x' or 'y', got {plane!r}.")
     if side not in ("+-", "+", "-"):
@@ -1119,8 +1663,10 @@ def generate_2D_uniform_circular_sector(
         Range of the normal form angle [rad], with the convention of ``xpart``
         (``x = r cos theta``, ``px = r sin theta`` for a linear map).
     normal_form : NormalForm4D
-        Computed non-resonant normal form of the one-turn map at the element
-        where the distribution is generated, in normalised coordinates.
+        Computed normal form of the one-turn map at the element where the
+        distribution is generated, in normalised coordinates: non-resonant,
+        or with one resonance (the sector is then only approximately
+        matched, with a warning: see :func:`_check_normal_form`).
     plane : {"x", "y"}, default "x"
         Plane of the sector.
     sigma_other : float, default 1
@@ -1139,10 +1685,10 @@ def generate_2D_uniform_circular_sector(
     Raises
     ------
     ValueError
-        If the arguments are invalid or the normal form is not computed or not
-        non-resonant.
+        If the arguments are invalid or the normal form is not computed or
+        has two resonances.
     """
-    _check_normal_form(normal_form)
+    _check_normal_form(normal_form, "other", "circular sector")
     if plane not in ("x", "y"):
         raise ValueError(f"plane must be 'x' or 'y', got {plane!r}.")
     if sigma_other < 0:
@@ -1176,8 +1722,9 @@ def generate_matched_gaussian_bunch(
     sigma_z: float,
     *,
     line: Any,
-    normal_form: NormalForm4D,
+    normal_form: NormalForm4D | Sequence[NormalForm4D],
     at_element: str,
+    seams: Sequence[float] | None = None,
     total_intensity_particles: float | None = None,
     engine: str | None = None,
     return_matcher: bool = False,
@@ -1214,11 +1761,24 @@ def generate_matched_gaussian_bunch(
     line : xtrack.Line
         Line with a built tracker.
     normal_form : NormalForm4D
-        Computed non-resonant normal form of the one-turn map at
-        ``at_element``, in normalised coordinates with emittances
-        ``nemitt_x, nemitt_y``.
+        Computed normal form of the one-turn map at ``at_element``, in
+        normalised coordinates with emittances ``nemitt_x, nemitt_y``:
+        non-resonant or with one resonance. The bunch is exactly matched for
+        a non-resonant normal form and for a coupling resonance (``(1, -1)``,
+        which keeps ``|zeta1|^2 + |zeta2|^2`` invariant), otherwise
+        approximately, with a warning (see :func:`_check_normal_form`).
+        A sequence of 2 to 4 normal forms (non-resonant or with the coupling
+        resonance, e.g. from maps fitted on different amplitude ranges) is
+        joined at the radii ``seams``.
     at_element : str
         Element at which the bunch is generated.
+    seams : sequence of float, optional
+        With several normal forms, the increasing normal form amplitudes
+        ``rho = sqrt(|zeta1|^2 + |zeta2|^2)`` [beam sizes] at which they are
+        joined: points sampled with ``rho`` between ``seams[k - 1]`` and
+        ``seams[k]`` use ``normal_form[k]``. Each seam is a set of tori of
+        both neighbouring normal forms, so the bunch stays matched up to
+        their mismatch there (check it with :func:`seam_mismatch`).
     total_intensity_particles : float, optional
         Bunch intensity; the weights are 1 if not given.
     engine : str, optional
@@ -1244,25 +1804,346 @@ def generate_matched_gaussian_bunch(
     Raises
     ------
     ValueError
-        If the tracker is not built or the normal form is not computed or not
-        non-resonant.
+        If the tracker is not built, the normal form is not computed or has
+        two resonances, or the normal forms joined by seams are invalid.
     """
-    import xpart as xp
-
-    _check_normal_form(normal_form)
-    if not line._has_valid_tracker():
-        raise ValueError("Please build the tracker of the line first.")
-    num_particles = int(num_particles)
-    if twiss is None:
-        twiss = line.twiss()
     rng = np.random.default_rng(seed)
-    zeta, delta, matcher = xp.generate_longitudinal_coordinates(
-        distribution="gaussian", num_particles=num_particles, line=line,
-        sigma_z=sigma_z, engine=engine, return_matcher=True,
+    return _matched_bunch(
+        num_particles, nemitt_x, nemitt_y, sigma_z, line, normal_form, at_element,
+        lambda m: rng.normal(size=(4, m)), None, total_intensity_particles, engine,
+        return_matcher, twiss, "sum", "Gaussian bunch", seams=seams, **kwargs,
     )
-    z = _from_normal_form(normal_form, num_particles, lambda m: rng.normal(size=(4, m)))
-    if total_intensity_particles is None:
-        total_intensity_particles = num_particles
-    part = _build_particles(line, twiss, at_element, z, zeta, delta, nemitt_x, nemitt_y,
-                            weight=total_intensity_particles / num_particles, **kwargs)
-    return (part, matcher) if return_matcher else part
+
+
+def generate_matched_qgaussian_bunch(
+    num_particles: int,
+    nemitt_x: float,
+    nemitt_y: float,
+    sigma_z: float,
+    *,
+    line: Any,
+    normal_form: NormalForm4D | Sequence[NormalForm4D],
+    at_element: str,
+    q: float,
+    beta: float,
+    fact: bool,
+    sigma_cut_x: float | None = None,
+    sigma_cut_y: float | None = None,
+    skew_cut: bool = True,
+    seams: Sequence[float] | None = None,
+    total_intensity_particles: float | None = None,
+    engine: str | None = None,
+    return_matcher: bool = False,
+    twiss: Any = None,
+    seed: int | np.random.Generator | None = None,
+    **kwargs: Any,
+) -> Any:
+    """
+    Generate a non-linearly matched q-Gaussian bunch.
+
+    Counterpart of :func:`generate_matched_gaussian_bunch` with q-Gaussian
+    transverse coordinates. The points are sampled in normal form
+    coordinates, either
+
+    - factorisable (``fact=True``): the product of independent 2D q-Gaussians
+      of the two planes, of density ``f(r_x) f(r_y)`` (:func:`_f_2D`), or
+    - non-factorisable (``fact=False``): the 4D q-Gaussian of density
+      ``f(m)`` (:func:`_f_4D`), depending only on the 4D radius
+      ``m^2 = r_x^2 + r_y^2``, with planes that are not independent,
+
+    with the same 1D q-Gaussian ``e_q(-beta u^2)`` as marginal of each
+    coordinate. With a normal form of the coupling resonance only the
+    non-factorisable model is exactly matched, as the resonance exchanges
+    the actions of the planes (the factorisable one is generated with a
+    warning). They are mapped to normalised coordinates with the inverse of
+    ``Psi``. Both densities depend only on the normal form actions, so they
+    are invariant under the one-turn map. ``q = 1`` is the Gaussian bunch of
+    variance ``1 / (2 beta)`` (both models then coincide).
+
+    The emittances only set the unit of the normalised coordinates (the
+    beam size of a Gaussian beam of that emittance); the width of the
+    q-Gaussian in these units is set by ``beta`` alone (variance
+    ``1 / (beta (5 - 3 q))`` of each coordinate for a linear map, infinite for
+    ``q >= 5/3``).
+
+    With ``sigma_cut_x`` and/or ``sigma_cut_y``, particles are kept only
+    within the cut on the radii ``r_x = hypot(x_norm, px_norm)`` and
+    ``r_y = hypot(y_norm, py_norm)`` in normalised coordinates:
+    ``r_x^2 / sigma_cut_x^2 + r_y^2 / sigma_cut_y^2 < 1`` (``skew_cut=True``,
+    as by a skew collimator) or ``r_x < sigma_cut_x`` and ``r_y < sigma_cut_y``
+    (``skew_cut=False``); a missing limit means no cut in that plane. Points
+    are sampled until exactly ``num_particles`` lie within the cut. The cut is
+    applied in normalised coordinates, where it is not a function of the
+    normal form actions: near its edge the cut distribution is not exactly
+    invariant (as a beam cut by collimators).
+
+    The longitudinal coordinates are a Gaussian bunch matched to the bucket,
+    as in :func:`generate_matched_gaussian_bunch`. The normal form must be
+    computed at ``at_element`` with the same emittances and be valid up to
+    the cut (without a cut, up to the amplitudes of the tails): points where
+    the transformation cannot be inverted are resampled with a warning.
+
+    Parameters
+    ----------
+    num_particles : int
+        Number of macroparticles.
+    nemitt_x, nemitt_y : float
+        Normalised emittances [m], the scale of the normalised coordinates.
+    sigma_z : float
+        RMS bunch length [m].
+    line : xtrack.Line
+        Line with a built tracker.
+    normal_form : NormalForm4D
+        Computed normal form of the one-turn map at ``at_element``, in
+        normalised coordinates with emittances ``nemitt_x, nemitt_y``:
+        non-resonant or with one resonance. The bunch is exactly matched for
+        a non-resonant normal form and for a coupling resonance (``(1, -1)``,
+        which keeps ``|zeta1|^2 + |zeta2|^2`` invariant), otherwise
+        approximately, with a warning (see :func:`_check_normal_form`).
+        A sequence of 2 to 4 normal forms (non-resonant or with the coupling
+        resonance, e.g. from maps fitted on different amplitude ranges) is
+        joined at the radii ``seams``.
+    at_element : str
+        Element at which the bunch is generated.
+    q : float
+        Parameter ``q`` of the q-Gaussian, ``1 <= q < 3``.
+    beta : float
+        Scale parameter of the q-Gaussian, positive [1 / beam size^2].
+    fact : bool
+        Factorisable (True) or non-factorisable (False) distribution.
+    sigma_cut_x, sigma_cut_y : float, optional
+        Limits of the cut on ``r_x`` and ``r_y`` [beam sizes], positive. No
+        cut if neither is given.
+    skew_cut : bool, default True
+        Elliptical cut in ``(r_x, r_y)`` (skew collimator) if True,
+        rectangular cut otherwise.
+    seams : sequence of float, optional
+        With several normal forms (non-factorisable model only), the
+        increasing normal form amplitudes at which they are joined (see
+        :func:`generate_matched_gaussian_bunch`).
+    total_intensity_particles : float, optional
+        Bunch intensity; the weights are 1 if not given.
+    engine : str, optional
+        Longitudinal matching engine, passed to
+        ``xpart.generate_longitudinal_coordinates``.
+    return_matcher : bool, default False
+        Also return the longitudinal matcher.
+    twiss : xtrack.TwissTable, optional
+        Twiss table of the line (6D), computed if not given.
+    seed : int or numpy.random.Generator, optional
+        Seed of the random generator of the transverse coordinates (the
+        longitudinal ones use the global ``numpy`` generator, as in ``xpart``).
+    **kwargs
+        Passed to ``line.build_particles``.
+
+    Returns
+    -------
+    particles : xtrack.Particles
+        The bunch at ``at_element``.
+    matcher : object
+        Longitudinal matcher, only if ``return_matcher`` is True.
+
+    Raises
+    ------
+    TypeError
+        If ``fact`` or ``skew_cut`` is not a bool.
+    ValueError
+        If ``q``, ``beta`` or a cut limit is out of range, the tracker is not
+        built, the normal form is not computed or has two resonances, or the
+        normal forms joined by seams are invalid (or factorisable).
+    RuntimeError
+        If the cut is too tight for the distribution.
+    """
+    _check_q_parameters(q, beta)
+    for name, value in (("fact", fact), ("skew_cut", skew_cut)):
+        if not isinstance(value, (bool, np.bool_)):
+            raise TypeError(f"{name} must be a bool, got {value!r}.")
+    cut = _normalised_cut(sigma_cut_x, sigma_cut_y, bool(skew_cut))
+    generate = _generate_factorizable if fact else _generate_nonfactorizable
+    rng = np.random.default_rng(seed)
+    return _matched_bunch(
+        num_particles, nemitt_x, nemitt_y, sigma_z, line, normal_form, at_element,
+        lambda m: generate(m, q, beta, rng), cut, total_intensity_particles, engine,
+        return_matcher, twiss, "sum" if (not fact or q == 1) else "other",
+        f"{'factorisable' if fact else 'non-factorisable'} q-Gaussian bunch",
+        seams=seams, **kwargs,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Joining normal forms
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class SeamMismatch:
+    """
+    Mismatch of two normal forms on seams of constant ``|zeta1|^2 + |zeta2|^2``.
+
+    Returned by :func:`seam_mismatch`. A distribution can be generated with
+    one normal form (``inner``) below a seam radius ``rho`` and another one
+    (``outer``) above, the seam being the level set ``rho^2 = |zeta1|^2 +
+    |zeta2|^2`` of an invariant of both. If the two normal forms were exact,
+    the seam would be the same set of tori in both. The differences
+    ``delta = rho_other(z) - rho`` of the seam radius seen by the other normal
+    form, at points ``z`` of the seam of one of them, measure the mismatch:
+    the inner part then ends at a slightly different place than where the
+    outer part begins, leaving a thin layer of thickness about ``|delta|``
+    that is covered twice (``delta > 0`` on the inner seam) or not at all
+    (``delta < 0``). The fraction of particles affected is about
+    ``p(rho) |delta|``, with ``p`` the density of the distribution in ``rho``.
+
+    Attributes
+    ----------
+    radii : numpy.ndarray, shape (R,)
+        Seam radii ``rho`` [beam sizes].
+    inner_to_outer, outer_to_inner : list of numpy.ndarray
+        For each radius, ``delta`` at points of the seam of the inner normal
+        form seen by the outer one, and vice versa [beam sizes] (points
+        where ``Psi`` could not be inverted are left out).
+    failed : numpy.ndarray, shape (R, 2)
+        Fraction of the seam points of the inner and of the outer normal form
+        at which ``Psi`` could not be inverted.
+    """
+
+    radii: np.ndarray
+    inner_to_outer: list[np.ndarray]
+    outer_to_inner: list[np.ndarray]
+    failed: np.ndarray
+
+    def summary(self) -> dict[str, np.ndarray]:
+        """
+        Statistics of the mismatch for each seam radius.
+
+        Returns
+        -------
+        dict of numpy.ndarray, shape (R,)
+            ``"mean"``, ``"rms"`` and ``"max"`` (of ``|delta|``) for each
+            direction (keys prefixed by ``"inner_to_outer_"`` and
+            ``"outer_to_inner_"``), and ``"rms"`` of both together.
+        """
+        out = {}
+        for name, data in (("inner_to_outer", self.inner_to_outer),
+                           ("outer_to_inner", self.outer_to_inner)):
+            out[f"{name}_mean"] = np.array([np.mean(d) if d.size else np.nan for d in data])
+            out[f"{name}_rms"] = np.array([np.sqrt(np.mean(d**2)) if d.size else np.nan for d in data])
+            out[f"{name}_max"] = np.array([np.max(np.abs(d)) if d.size else np.nan for d in data])
+        both = [np.concatenate([a, b]) for a, b in zip(self.inner_to_outer, self.outer_to_inner)]
+        out["rms"] = np.array([np.sqrt(np.mean(d**2)) if d.size else np.nan for d in both])
+        return out
+
+    @property
+    def best_radius(self) -> float:
+        """
+        Seam radius with the smallest RMS mismatch.
+
+        Returns
+        -------
+        float
+            The radius [beam sizes].
+        """
+        rms = self.summary()["rms"]
+        return float(self.radii[np.nanargmin(rms)])
+
+
+def _seam_invariant_check(normal_form: NormalForm4D, name: str) -> None:
+    """
+    Check that ``|zeta1|^2 + |zeta2|^2`` is invariant for a normal form.
+
+    Parameters
+    ----------
+    normal_form : NormalForm4D
+        Normal form.
+    name : str
+        Name of the argument, for the message.
+
+    Raises
+    ------
+    ValueError
+        If the normal form is not computed, or keeps a resonance other than
+        the coupling resonances ``(n, -n)``.
+    """
+    if normal_form.Psi is None:
+        raise ValueError(f"The normal form {name} has not been computed.")
+    resonance = _normal_form_resonance(normal_form)
+    if resonance is not None and resonance[0] + resonance[1] != 0:
+        raise ValueError(
+            f"The normal form {name} keeps the resonance {resonance}, for which "
+            "|zeta1|^2 + |zeta2|^2 is not invariant: a seam on it would not be "
+            "made of tori. Seams are supported for non-resonant normal forms "
+            "and the coupling resonance (1, -1)."
+        )
+
+
+def seam_mismatch(
+    inner: NormalForm4D,
+    outer: NormalForm4D,
+    radii: float | Sequence[float],
+    num_points: int = 2000,
+    seed: int | np.random.Generator | None = None,
+) -> SeamMismatch:
+    """
+    Mismatch of two normal forms joined on seams of constant 4D amplitude.
+
+    For each radius ``rho``, points are drawn uniformly on the seam
+    ``|zeta1|^2 + |zeta2|^2 = rho^2`` of each normal form (uniform phases,
+    ``|zeta1|^2`` uniform in ``[0, rho^2]``), mapped to normalised
+    coordinates with the inverse of its ``Psi`` and to the normal form
+    coordinates of the other one, where their radius is compared with
+    ``rho`` (see :class:`SeamMismatch`). Both normal forms must keep
+    ``|zeta1|^2 + |zeta2|^2`` invariant (non-resonant, or with the coupling
+    resonance), and be computed on the same normalised coordinates (same
+    element, emittances and twiss), e.g. from one-turn maps fitted on
+    different amplitude ranges (``OneTurnMap4D(..., sigma_min=...)``).
+
+    Parameters
+    ----------
+    inner, outer : NormalForm4D
+        Normal forms used below and above the seam.
+    radii : float or sequence of float
+        Seam radii ``rho`` to test [beam sizes].
+    num_points : int, default 2000
+        Number of points per seam and normal form.
+    seed : int or numpy.random.Generator, optional
+        Seed of the random generator.
+
+    Returns
+    -------
+    SeamMismatch
+        The mismatch for each radius.
+
+    Raises
+    ------
+    ValueError
+        If a normal form is not computed or does not keep
+        ``|zeta1|^2 + |zeta2|^2`` invariant, or the arguments are invalid.
+    """
+    _seam_invariant_check(inner, "inner")
+    _seam_invariant_check(outer, "outer")
+    radii = np.atleast_1d(np.asarray(radii, dtype=float))
+    if radii.ndim != 1 or np.any(radii <= 0):
+        raise ValueError("radii must be positive.")
+    num_points = int(num_points)
+    if num_points < 1:
+        raise ValueError(f"num_points must be positive, got {num_points}.")
+    rng = np.random.default_rng(seed)
+    t_in, t_out = _Transforms(inner, "x"), _Transforms(outer, "x")
+    results = {"inner_to_outer": [], "outer_to_inner": []}
+    failed = np.zeros((radii.size, 2))
+    for k, rho in enumerate(radii):
+        for col, (name, src, dst) in enumerate(
+            (("inner_to_outer", t_in, t_out), ("outer_to_inner", t_out, t_in))
+        ):
+            u = rng.uniform(0, 1, num_points)
+            th = rng.uniform(0, 2 * np.pi, (2, num_points))
+            zeta = src.torus(rho * np.sqrt(u), rho * np.sqrt(1 - u), th[0], th[1])
+            z = src.psi_inverse(zeta, _TOL_INVERSE)
+            ok = np.all(np.isfinite(z), axis=0)
+            failed[k, col] = 1 - ok.mean()
+            seen = dst.psi(_to_complex(z[:, ok]))
+            rho_seen = np.sqrt(np.abs(seen[0]) ** 2 + np.abs(seen[2]) ** 2)
+            results[name].append(rho_seen - rho)
+    return SeamMismatch(
+        radii=radii, inner_to_outer=results["inner_to_outer"],
+        outer_to_inner=results["outer_to_inner"], failed=failed,
+    )
