@@ -815,6 +815,159 @@ class TestHamiltonianTori:
             hamiltonian_tori(nf, TORI_Z0)
 
 
+class TestToriOnePlaneExact:
+    """Checks of TestHamiltonianOrbitsExact with tori: one-plane starts, circles."""
+
+    @pytest.fixture
+    def setup(self):
+        nf = StubNormalForm(detuning_hamiltonian())
+        _, _, _, z0 = initial_conditions("both", sigma_limit=3, radial_step=1)
+        return nf, z0
+
+    def test_circles(self, setup):
+        nf, z0 = setup
+        ht = hamiltonian_tori(nf, z0, num_points=4096)
+        assert ht.num_particles == 36 and ht.resonance is None
+        for i in range(ht.num_particles):
+            (t,) = ht.tori_nf[i]
+            # no amplitude in the other plane: the torus is a single circle
+            assert t.shape == (4, 4096, 1)
+            k = 0 if ht.plane[i] == "x" else 2
+            np.testing.assert_allclose(np.hypot(t[k], t[k + 1]), np.hypot(*z0[k:k + 2, i]),
+                                       rtol=1e-12)
+            assert np.all(t[2 - k] == 0) and np.all(t[3 - k] == 0)
+            np.testing.assert_allclose(ht.tori_norm[i][0], t, atol=1e-12)
+
+    def test_labels_from_array(self, setup):
+        nf, z0 = setup
+        ht = hamiltonian_tori(nf, z0, num_points=256)
+        planes, _, _, _ = initial_conditions("both", 3, 1)
+        np.testing.assert_array_equal(ht.plane, planes)
+        np.testing.assert_allclose(ht.z0_norm, z0)
+        np.testing.assert_allclose(ht.z0_nf, z0, atol=1e-15)
+
+    def test_h0(self, setup):
+        nf, z0 = setup
+        ht = hamiltonian_tori(nf, z0, num_points=256)
+        J1, J2 = (z0[0] ** 2 + z0[1] ** 2), (z0[2] ** 2 + z0[3] ** 2)
+        np.testing.assert_allclose(ht.h0, 1.9 * J1 + 2.0 * J2 + 0.05 * J1**2 + 0.03 * J1 * J2)
+
+    def test_accuracy_with_exact_flow(self, setup):
+        # Track with the exact flow of H: rotation with action-dependent tunes
+        nf, z0 = setup
+
+        def step(z):
+            x, px, y, py = z
+            J1, J2 = x**2 + px**2, y**2 + py**2
+            mu1, mu2 = 1.9 + 2 * 0.05 * J1 + 0.03 * J2, 2.0 + 0.03 * J1
+            zeta1 = (x - 1j * px) * np.exp(1j * mu1)
+            zeta2 = (y - 1j * py) * np.exp(1j * mu2)
+            return np.real(np.array(complex_to_real(zeta1, np.conj(zeta1), zeta2, np.conj(zeta2))))
+
+        orb = tracked_orbits_from(z0, 50, step)
+        ht = hamiltonian_tori(nf, orb, num_points=4096)
+        r = np.hypot(z0[0], z0[1]) + np.hypot(z0[2], z0[3])
+        # nearest of 4096 equally spaced points on the circle: at most pi r / 4096
+        assert np.all(ht.distance(orb) <= (np.pi * r / 4096)[:, None] * (1 + 1e-6))
+
+
+class TestToriOrbitSelection:
+    """Checks of TestOrbitSelection with tori: orbits on the same level of h."""
+
+    def test_two_circles_same_level(self):
+        nf = StubNormalForm(Polynom([Term(2j, 1, 1, 0, 0), Term(-0.5j, 2, 2, 0, 0)]))
+        z0 = np.array([[1.0, np.sqrt(3.0)], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
+        ht = hamiltonian_tori(nf, z0, num_points=1024)
+        assert ht.h0[0] == pytest.approx(ht.h0[1])
+        for i, r in enumerate((1.0, np.sqrt(3.0))):
+            (t,) = ht.tori_nf[i]
+            np.testing.assert_allclose(np.hypot(t[0], t[1]), r, rtol=1e-12)
+
+    def test_islands_core_and_outside(self):
+        """Same Hamiltonian and initial points as TestOrbitSelection."""
+        nf = StubNormalForm(
+            Polynom([Term(-1j, 1, 1, 0, 0), Term(0.5j, 2, 2, 0, 0),
+                     Term(0.025j, 4, 0, 0, 0), Term(0.025j, 0, 4, 0, 0)]),
+            tunes=(0.25, 0.32),
+        )
+        J_core = 0.4
+        h_core = -J_core + 0.55 * J_core**2
+        J_out = (1 + np.sqrt(1 + 2.2 * h_core)) / 1.1
+        J_island = 0.8
+        r = np.sqrt([J_core, J_out, J_island])
+        z0 = np.array([[r[0], r[1], r[2] / np.sqrt(2)], [0.0, 0.0, r[2] / np.sqrt(2)],
+                       [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+        ht = hamiltonian_tori(nf, z0, num_points=4096)
+        assert ht.resonance == (1, 0)
+        assert ht.h0[0] == pytest.approx(ht.h0[1])
+        assert [len(t) for t in ht.tori_nf] == [1, 1, 4]
+        for i in (0, 1):
+            rr = np.hypot(*ht.tori_nf[i][0][:2])
+            assert np.min(np.abs(rr - r[i])) < 1e-3 and np.max(rr) < (1.1 if i == 0 else 2)
+            assert (np.max(rr) < 1) == (i == 0)
+        centres = [np.angle(np.mean(t[0]) + 1j * np.mean(t[1]), deg=True) % 360
+                   for t in ht.tori_nf[2]]
+        np.testing.assert_allclose(sorted(centres), [45, 135, 225, 315], atol=1)
+
+
+class TestToriLHC:
+    """Checks of TestHamiltonianOrbitsLHC with tori."""
+
+    def test_nominal_line(self, lhc_line, twiss, normal_form, orbits):
+        ht = hamiltonian_tori(normal_form, orbits)
+        assert ht.resonance is None
+        assert all(len(t) == 1 for t in ht.tori_nf)
+        # The 4D distance is limited by the spacing of the points of the tori
+        # (bands where the other plane has a normal form amplitude), not by
+        # the accuracy of the normal form.
+        spacing = np.array([max(np.max(np.linalg.norm(np.diff(t, axis=ax), axis=0), initial=0)
+                                for ax in (1, 2)) for (t,) in ht.tori_nf])
+        for coordinates in ("nf", "norm"):
+            d = ht.distance(orbits, coordinates)
+            assert np.all(np.nanmax(d, axis=1) < spacing), coordinates
+        # array input gives the same tori
+        z0 = np.array([orbits.x_norm[:, 0], orbits.px_norm[:, 0],
+                       orbits.y_norm[:, 0], orbits.py_norm[:, 0]])
+        ht2 = hamiltonian_tori(normal_form, z0)
+        np.testing.assert_array_equal(ht2.plane, ht.plane)
+        np.testing.assert_allclose(ht2.h0, ht.h0)
+
+    def test_fourth_order_islands(self, lhc_line):
+        """Quasi-resonant normal form at 4 Qx = 1: the tori are island chains."""
+        from xnf4d.one_turn_map import OneTurnMap4D
+
+        line = lhc_line
+        saved = {k: line.vars[k]._value for k in ("dqx.b1", "dqy.b1", "i_mo_b1")}
+        try:
+            line.vars["i_mo_b1"] = -26
+            for _ in range(2):
+                tw = line.twiss()
+                line.vars["dqx.b1"] = line.vars["dqx.b1"]._value + 62.28 - tw.qx
+                line.vars["dqy.b1"] = line.vars["dqy.b1"]._value + 60.31 - tw.qy
+            otm = OneTurnMap4D(line, 8, nemitt_x=NEMITT, nemitt_y=NEMITT, seed=1)
+            qy = otm.twiss.qy % 1
+            nf = otm.calculate_normal_form(
+                7, "quasiresonant", res_basis1=[4, 0],
+                res_eig=[1j, -1j, np.exp(2j * np.pi * qy), np.exp(-2j * np.pi * qy)],
+            )
+            orb = track_orbits(line, NEMITT, NEMITT, plane="x", sigma_limit=7,
+                               radial_step=1, num_turns=256, twiss=otm.twiss, angles=[0, 54],
+                               normal_form=nf)
+        finally:
+            for k, v in saved.items():
+                line.vars[k] = v
+        ht = hamiltonian_tori(nf, orb)
+        assert ht.resonance == (1, 0)
+        inside = orb.radius == 7      # in the islands
+        inner = orb.radius <= 3       # well below them
+        counts = np.array([len(t) for t in ht.tori_nf])
+        assert set(counts) <= {1, 4}, counts
+        assert np.all(counts[inside] == 4) and np.all(counts[inner] == 1), counts
+        d = ht.distance(orb, "nf")
+        assert np.nanmax(d[inner]) < 1e-2
+        assert np.nanmax(d[inside]) < 0.6
+
+
 class TestStitchedTori:
     def test_same_normal_form_matches_single(self):
         nf = StubNormalForm(tori_hamiltonian(COUPLING))
