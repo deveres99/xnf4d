@@ -225,8 +225,8 @@ def plot(particles, particles_norm, title):
             color="orange", linestyle='--', linewidth=2
         )
 
-    axes[0].set_xlim((SIGMA_MAX+1), -(SIGMA_MAX+1))
-    axes[0].set_ylim((SIGMA_MAX+1), -(SIGMA_MAX+1))
+    axes[0].set_xlim(-(SIGMA_MAX+1), (SIGMA_MAX+1))
+    axes[0].set_ylim(-(SIGMA_MAX+1), (SIGMA_MAX+1))
     axes[0].set_xlabel(r"$\hat{x}$ [$\sigma$]", fontsize=fs)
     axes[0].set_ylabel(r"$\hat{p}_x$ [$\sigma$]", fontsize=fs)
     axes[0].tick_params(axis="both", labelsize=fs-2)
@@ -234,8 +234,8 @@ def plot(particles, particles_norm, title):
     cbar0.ax.tick_params(labelsize=fs-2)
     cbar0.set_label("particles per bin", fontsize=fs)
 
-    axes[1].set_xlim((SIGMA_MAX+1), -(SIGMA_MAX+1))
-    axes[1].set_ylim((SIGMA_MAX+1), -(SIGMA_MAX+1))
+    axes[1].set_xlim(-(SIGMA_MAX+1), (SIGMA_MAX+1))
+    axes[1].set_ylim(-(SIGMA_MAX+1), (SIGMA_MAX+1))
     axes[1].set_xlabel(r"$\hat{y}$ [$\sigma$]", fontsize=fs)
     axes[1].set_ylabel(r"$\hat{p}_y$ [$\sigma$]", fontsize=fs)
     axes[1].tick_params(axis="both", labelsize=fs-2)
@@ -250,8 +250,8 @@ def plot(particles, particles_norm, title):
     cbar2.ax.tick_params(labelsize=fs-2)
     cbar2.set_label("particles per bin", fontsize=fs)
 
-    axes[3].set_xlim((SIGMA_MAX+1), -(SIGMA_MAX+1))
-    axes[3].set_ylim((SIGMA_MAX+1), -(SIGMA_MAX+1))
+    axes[3].set_xlim(-(SIGMA_MAX+1), (SIGMA_MAX+1))
+    axes[3].set_ylim(-(SIGMA_MAX+1), (SIGMA_MAX+1))
     axes[3].set_xlabel(r"$\hat{x}$ [$\sigma$]", fontsize=fs)
     axes[3].set_ylabel(r"$\hat{y}$ [$\sigma$]", fontsize=fs)
     axes[3].tick_params(axis="both", labelsize=fs-2)
