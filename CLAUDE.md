@@ -148,7 +148,15 @@ each NF's rho, ties broken by |z0|); `tori.region`, `select("x"/"y")`,
   (function of A1 + A2) are matched with non-resonant and (1,-1) NFs; other
   cases warn ("approximately matched"); double resonances rejected.
   q-Gaussians = Student t (exact sampling, 1 <= q < 3); emittance is only the
-  scale of normalised coordinates; cuts are in normalised coordinates.
+  scale of normalised coordinates.
+- q-Gaussian cuts (`sigma_cut_x/y` in normalised coordinates) keep whole tori
+  inside the cut (max of the cut function over the torus < 1), so the bunch stays
+  matched; identical to the plain cut for a linear map. Implemented as a boundary
+  table on rays in (|zeta1|, |zeta2|) (bisection with `_torus_depth`, star-shaped
+  assumption), applied before inverting Psi (`_torus_cut`, `_cuts`). Resonant NFs:
+  only a shell cut on A1 + A2 is matched (largest shell inside the cut) - used for
+  `skew_cut=True` with equal limits; otherwise warn and fall back to the plain cut
+  in normalised coordinates (`strict_cut=True` forces the shell cut).
 - **Stitching**: bunch functions accept `normal_form=[nf0, nf1, ...]` (2-4) with
   `seams=[rho1, ...]` on rho = sqrt(A1 + A2); only NFs keeping A1 + A2 invariant,
   only densities of A1 + A2. `seam_mismatch(inner, outer, radii)` measures the
