@@ -125,6 +125,11 @@ _TOL_INVERSE = 1e-9
 #: Points sampled in normal form coordinates beyond this multiple of a cut
 #: are discarded without inverting Psi.
 _CUT_MARGIN = 2.0
+#: Rays in the plane of the normal form amplitudes ``(|zeta1|, |zeta2|)`` on
+#: which the boundary of a cut of whole tori is found.
+_CUT_RAYS = 65
+#: Doublings of the search interval and bisection steps for that boundary.
+_CUT_GROW, _CUT_BISECT = 4, 40
 #: Largest number of points sampled at once in normal form coordinates.
 _MAX_BATCH = 200_000
 #: Points sampled per requested point before a cut is deemed too tight.
@@ -770,7 +775,7 @@ def _from_normal_form(
     normal_form: NormalForm4D | Sequence[NormalForm4D],
     num_particles: int,
     sample: Callable[[int], np.ndarray],
-    cut: Callable[[np.ndarray, float], np.ndarray] | None = None,
+    cut: tuple[float | None, float | None, bool, bool] | None = None,
     seams: Sequence[float] | None = None,
 ) -> np.ndarray:
     """
@@ -783,13 +788,16 @@ def _from_normal_form(
     this fails (where the normal form is not valid) are discarded with a
     warning and replaced by new samples.
 
-    With a ``cut``, only points within the cut in normalised coordinates are
-    kept, and new samples are drawn until there are ``num_particles`` of
-    them. Points beyond the cut enlarged by ``_CUT_MARGIN`` in normal form
-    coordinates are discarded without inverting ``Psi``: as long as the
-    normal form is valid, ``Psi`` changes the amplitudes much less than that.
-    Failed inversions are reported only for points within the cut in normal
-    form coordinates (the others would most likely be cut).
+    With a ``cut`` (see :func:`_cuts`), only points within the cut are kept,
+    and new samples are drawn until there are ``num_particles`` of them. A
+    cut of whole tori is applied in normal form coordinates, before
+    inverting ``Psi``. A cut in normalised coordinates (the fallback for
+    resonant normal forms) is applied after: points beyond it enlarged by
+    ``_CUT_MARGIN`` in normal form coordinates are discarded without
+    inverting ``Psi`` (as long as the normal form is valid, ``Psi`` changes
+    the amplitudes much less than that). Failed inversions are reported only
+    for points within the cut in normal form coordinates (the others would
+    most likely be cut).
 
     With several normal forms joined by ``seams``, a point with normal form
     amplitude ``rho = sqrt(|zeta1|^2 + |zeta2|^2)`` between ``seams[k - 1]``
@@ -804,9 +812,9 @@ def _from_normal_form(
         Number of points.
     sample : callable
         ``sample(m)`` returns ``m`` points ``w``, shape ``(4, m)``.
-    cut : callable, optional
-        ``cut(u, scale)`` returns whether the points ``u``, shape ``(4, m)``,
-        lie within the cut with its limits multiplied by ``scale``.
+    cut : tuple, optional
+        ``(sigma_cut_x, sigma_cut_y, skew_cut, strict_cut)``, see
+        :func:`_cuts`.
     seams : sequence of float, optional
         Increasing seam radii [beam sizes], one fewer than the normal forms.
 
@@ -824,13 +832,18 @@ def _from_normal_form(
         normal_form, Sequence) else list(normal_form)
     transforms = [_Transforms(nf, "x") for nf in forms]
     seams = np.asarray([] if seams is None else seams, dtype=float)
+    cut, nf_cut = (None, None) if cut is None else _cuts(forms, transforms, seams, *cut)
     accepted, n_acc, n_tried, n_failed = [], 0, 0, 0
     while n_acc < num_particles:
         missing = num_particles - n_acc
         rate = max(n_acc, 1) / n_tried if n_tried else 1.0
         m = int(min(max(64, 1.2 * missing / rate), _MAX_BATCH)) if n_tried else missing
         w = sample(m)
-        if cut is None:
+        if nf_cut is not None:
+            candidate, invalid = nf_cut(w)
+            inside = candidate
+            n_failed += int(invalid.sum())
+        elif cut is None:
             candidate = inside = np.ones(m, dtype=bool)
         else:
             candidate, inside = cut(w, _CUT_MARGIN), cut(w, 1.0)
@@ -843,7 +856,7 @@ def _from_normal_form(
                 z[:, sel] = transform.psi_inverse(_to_complex(w[:, sel]), _TOL_INVERSE)
         finite = np.all(np.isfinite(z), axis=0)
         n_failed += int(np.sum(candidate & inside & ~finite))
-        ok = finite if cut is None else finite & cut(np.where(finite, z, 0.0), 1.0)
+        ok = finite & candidate if cut is None else finite & cut(np.where(finite, z, 0.0), 1.0)
         accepted.append(z[:, ok])
         n_acc += int(ok.sum())
         n_tried += m
@@ -906,6 +919,210 @@ def _normalised_cut(
         return a * a + b * b < 1 if skew_cut else (a < 1) & (b < 1)
 
     return cut
+
+
+def _torus_cut(
+    transforms: Sequence[_Transforms],
+    seams: np.ndarray,
+    lim_x: float,
+    lim_y: float,
+    skew_cut: bool,
+    shell: bool,
+) -> Callable[[np.ndarray], np.ndarray]:
+    """
+    Cut of whole invariant tori, in normal form coordinates.
+
+    A torus of the normal form is kept if all of its points lie within the
+    cut of :func:`_normalised_cut` in normalised coordinates: as a function
+    of the invariants, the cut keeps the distribution matched. For a linear
+    map (``Psi`` the identity) it is the cut in normalised coordinates.
+
+    The torus of amplitudes ``(r1, r2) = (|zeta1|, |zeta2|)`` is kept if
+    ``g(r1, r2) kappa(phi) < 1``, with ``g`` the cut function of the linear
+    case (``hypot(r1 / lim_x, r2 / lim_y)`` or ``max(r1 / lim_x, r2 /
+    lim_y)``, homogeneous of degree 1), ``phi = atan2(r2, r1)`` and
+    ``kappa`` the inverse of the boundary found by bisection on
+    ``_CUT_RAYS`` rays of ``phi`` (linear interpolation between them, 1 in
+    the linear case). The largest value of the cut function on a torus is
+    found with :func:`_torus_depth`; the region kept is assumed to be
+    star-shaped. Tori that cannot be computed count as beyond the cut; the
+    points beyond the cut where its boundary is set by them are reported as
+    invalid (where the normal form is not valid).
+
+    With ``shell``, the points kept are instead those within the largest
+    shell ``|zeta1|^2 + |zeta2|^2 = rho^2`` lying entirely within the cut
+    (the smallest boundary radius over the rays): the cut is then a function
+    of ``|zeta1|^2 + |zeta2|^2`` only, invariant also for a coupling
+    resonance.
+
+    Parameters
+    ----------
+    transforms : sequence of _Transforms
+        Transformations of the normal forms (plane ``"x"``), from the
+        innermost.
+    seams : numpy.ndarray
+        Seam radii, one fewer than the normal forms.
+    lim_x, lim_y : float
+        Limits [beam sizes], positive, ``inf`` for no cut in a plane.
+    skew_cut : bool
+        Elliptical cut in ``(r_x, r_y)`` if True, rectangular otherwise.
+    shell : bool
+        Cut on ``|zeta1|^2 + |zeta2|^2`` only.
+
+    Returns
+    -------
+    callable
+        ``cut(w)`` returns, for points of normal form coordinates ``w``
+        (real form, shape ``(4, m)``), whether they lie within the cut and
+        whether they are beyond it because the normal form is not valid.
+    """
+    from types import SimpleNamespace
+
+    def size(r1: np.ndarray, r2: np.ndarray) -> np.ndarray:
+        a, b = r1 / lim_x, r2 / lim_y
+        return np.hypot(a, b) if skew_cut else np.maximum(a, b)
+
+    # cut functions minus 1 in normalised coordinates, as jaw depths
+    if skew_cut:
+        funcs = [lambda z: size(np.hypot(z[0], z[1]), np.hypot(z[2], z[3])) - 1]
+    else:
+        funcs = [lambda z, j=j, lim=lim: np.hypot(z[j], z[j + 1]) / lim - 1
+                 for j, lim in ((0, lim_x), (2, lim_y)) if np.isfinite(lim)]
+    geometries = [SimpleNamespace(depth=f) for f in funcs]
+
+    phi = np.linspace(0.0, 0.5 * np.pi, _CUT_RAYS)
+    cos, sin = np.cos(phi), np.sin(phi)
+    unit = size(cos, sin)  # rays with unit = 0 are not cut
+
+    def excess(s: np.ndarray, k: np.ndarray) -> np.ndarray:
+        """Largest cut function minus 1 on the tori at ``rho = s / unit``."""
+        rho = s / unit[k]
+        region = np.searchsorted(seams, rho, side="right")
+        out = np.full(s.shape, -np.inf)
+        for j, transform in enumerate(transforms):
+            sel = region == j
+            if sel.any():
+                for geometry in geometries:
+                    out[sel] = np.maximum(out[sel], _torus_depth(
+                        transform, geometry, rho[sel] * cos[k[sel]], rho[sel] * sin[k[sel]],
+                        _TOL_INVERSE, limit=0.0))
+        return out
+
+    # bracket the boundary s (s = 1 in the linear case), then bisect
+    lo, hi = np.zeros(_CUT_RAYS), np.full(_CUT_RAYS, 2.0)
+    grow = unit > 0
+    for _ in range(_CUT_GROW):
+        k = np.flatnonzero(grow)
+        if k.size == 0:
+            break
+        inside = excess(hi[k], k) < 0
+        lo[k[inside]], hi[k[inside]] = hi[k[inside]], 2 * hi[k[inside]]
+        grow[k[~inside]] = False
+    hi[grow | (unit == 0)] = np.inf
+    k = np.flatnonzero(np.isfinite(hi))
+    for _ in range(_CUT_BISECT):
+        mid = 0.5 * (lo[k] + hi[k])
+        inside = excess(mid, k) < 0
+        lo[k[inside]], hi[k[~inside]] = mid[inside], mid[~inside]
+    # rays whose boundary is set by the validity of the normal form
+    limited = np.zeros(_CUT_RAYS)
+    limited[k] = np.isnan(excess(hi[k], k))
+    s = 0.5 * (lo + hi)
+
+    if shell:
+        j = k[np.argmin(s[k] / unit[k])]
+        rho_max = s[j] / unit[j]
+
+        def shell_cut(w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            inside = np.sum(w**2, axis=0) < rho_max**2
+            return inside, ~inside & bool(limited[j])
+
+        return shell_cut
+    kappa = np.where(np.isfinite(s), 1.0 / s, 0.0)
+    kappa[unit == 0] = 1.0
+
+    def cut(w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        r1, r2 = np.hypot(w[0], w[1]), np.hypot(w[2], w[3])
+        th = np.arctan2(r2, r1)
+        inside = size(r1, r2) * np.interp(th, phi, kappa) < 1
+        return inside, ~inside & (np.interp(th, phi, limited) > 0)
+
+    return cut
+
+
+def _cuts(
+    forms: Sequence[NormalForm4D],
+    transforms: Sequence[_Transforms],
+    seams: np.ndarray,
+    sigma_cut_x: float | None,
+    sigma_cut_y: float | None,
+    skew_cut: bool,
+    strict_cut: bool,
+) -> tuple[Callable[[np.ndarray, float], np.ndarray] | None,
+           Callable[[np.ndarray], np.ndarray] | None]:
+    """
+    Cut of a distribution sampled in normal form coordinates.
+
+    With non-resonant normal forms, whole tori within the cut in normalised
+    coordinates are kept (:func:`_torus_cut`), so the distribution stays
+    matched. With a resonant normal form (any of ``forms``) only a cut on
+    ``|zeta1|^2 + |zeta2|^2`` is (for a coupling resonance) invariant: the
+    largest shell within the cut. For an elliptical cut with equal limits it
+    is the cut of whole tori; otherwise it is stricter, and by default
+    (``strict_cut=False``) the cut is applied in normalised coordinates
+    instead (:func:`_normalised_cut`, approximately matched); both cases
+    warn.
+
+    Parameters
+    ----------
+    forms : sequence of NormalForm4D
+        Normal forms, from the innermost.
+    transforms : sequence of _Transforms
+        Their transformations (plane ``"x"``).
+    seams : numpy.ndarray
+        Seam radii, one fewer than the normal forms.
+    sigma_cut_x, sigma_cut_y : float or None
+        Limits [beam sizes], at least one given.
+    skew_cut : bool
+        Elliptical cut if True, rectangular otherwise.
+    strict_cut : bool
+        Use the shell cut with a resonant normal form even if stricter.
+
+    Returns
+    -------
+    cut : callable or None
+        Cut in normalised coordinates (see :func:`_normalised_cut`).
+    nf_cut : callable or None
+        Cut in normal form coordinates (see :func:`_torus_cut`).
+
+    Warns
+    -----
+    UserWarning
+        With a resonant normal form and a rectangular cut or unequal limits.
+    """
+    resonant = any(_normal_form_resonance(nf) is not None for nf in forms)
+    if resonant and not (skew_cut and sigma_cut_x == sigma_cut_y):
+        text = (
+            "With a resonant normal form only a cut on |zeta1|^2 + |zeta2|^2 is "
+            "matched: the largest such shell within the cut, which is stricter than "
+            "a rectangular cut or a cut with unequal limits."
+        )
+        if not strict_cut:
+            warnings.warn(
+                f"{text} The cut is applied in normalised coordinates instead, so "
+                "the bunch is only approximately matched near it (strict_cut=True "
+                "applies the shell cut).",
+                stacklevel=4,
+            )
+            return _normalised_cut(sigma_cut_x, sigma_cut_y, skew_cut), None
+        warnings.warn(
+            f"{text} It removes tori within the cut (strict_cut=False applies the "
+            "cut in normalised coordinates, approximately matched).",
+            stacklevel=4,
+        )
+    lim_x = np.inf if sigma_cut_x is None else float(sigma_cut_x)
+    lim_y = np.inf if sigma_cut_y is None else float(sigma_cut_y)
+    return None, _torus_cut(transforms, seams, lim_x, lim_y, skew_cut, resonant)
 
 
 # --------------------------------------------------------------------------- #
@@ -1356,7 +1573,7 @@ def _matched_bunch(
     normal_form: NormalForm4D,
     at_element: str,
     sample: Callable[[int], np.ndarray],
-    cut: Callable[[np.ndarray, float], np.ndarray] | None,
+    cut: tuple[float | None, float | None, bool, bool] | None,
     total_intensity_particles: float | None,
     engine: str | None,
     return_matcher: bool,
@@ -1830,6 +2047,7 @@ def generate_matched_qgaussian_bunch(
     sigma_cut_x: float | None = None,
     sigma_cut_y: float | None = None,
     skew_cut: bool = True,
+    strict_cut: bool = False,
     seams: Sequence[float] | None = None,
     total_intensity_particles: float | None = None,
     engine: str | None = None,
@@ -1866,16 +2084,21 @@ def generate_matched_qgaussian_bunch(
     ``1 / (beta (5 - 3 q))`` of each coordinate for a linear map, infinite for
     ``q >= 5/3``).
 
-    With ``sigma_cut_x`` and/or ``sigma_cut_y``, particles are kept only
-    within the cut on the radii ``r_x = hypot(x_norm, px_norm)`` and
-    ``r_y = hypot(y_norm, py_norm)`` in normalised coordinates:
-    ``r_x^2 / sigma_cut_x^2 + r_y^2 / sigma_cut_y^2 < 1`` (``skew_cut=True``,
-    as by a skew collimator) or ``r_x < sigma_cut_x`` and ``r_y < sigma_cut_y``
-    (``skew_cut=False``); a missing limit means no cut in that plane. Points
-    are sampled until exactly ``num_particles`` lie within the cut. The cut is
-    applied in normalised coordinates, where it is not a function of the
-    normal form actions: near its edge the cut distribution is not exactly
-    invariant (as a beam cut by collimators).
+    With ``sigma_cut_x`` and/or ``sigma_cut_y``, particles are kept only on
+    the invariant tori lying entirely within the cut on the radii
+    ``r_x = hypot(x_norm, px_norm)`` and ``r_y = hypot(y_norm, py_norm)`` in
+    normalised coordinates: ``r_x^2 / sigma_cut_x^2 + r_y^2 / sigma_cut_y^2
+    < 1`` (``skew_cut=True``, as by a skew collimator) or ``r_x < sigma_cut_x``
+    and ``r_y < sigma_cut_y`` (``skew_cut=False``); a missing limit means no
+    cut in that plane. These are the tori that never reach collimators at the
+    limits, so the cut distribution stays matched; for a linear map this is
+    the cut of the particles themselves. Points are sampled until exactly
+    ``num_particles`` lie within the cut. With a resonant normal form only a
+    cut on ``|zeta1|^2 + |zeta2|^2`` is matched (the largest such shell
+    within the cut, used for ``skew_cut=True`` with equal limits); for other
+    cuts it is stricter than requested, and by default the cut is instead
+    applied to the particles in normalised coordinates, approximately
+    matched (see ``strict_cut``); both cases warn.
 
     The longitudinal coordinates are a Gaussian bunch matched to the bucket,
     as in :func:`generate_matched_gaussian_bunch`. The normal form must be
@@ -1917,6 +2140,10 @@ def generate_matched_qgaussian_bunch(
     skew_cut : bool, default True
         Elliptical cut in ``(r_x, r_y)`` (skew collimator) if True,
         rectangular cut otherwise.
+    strict_cut : bool, default False
+        With a resonant normal form and a rectangular cut or unequal limits,
+        apply the (stricter, matched) shell cut instead of the cut in
+        normalised coordinates. Ignored otherwise.
     seams : sequence of float, optional
         With several normal forms (non-factorisable model only), the
         increasing normal form amplitudes at which they are joined (see
@@ -1946,7 +2173,7 @@ def generate_matched_qgaussian_bunch(
     Raises
     ------
     TypeError
-        If ``fact`` or ``skew_cut`` is not a bool.
+        If ``fact``, ``skew_cut`` or ``strict_cut`` is not a bool.
     ValueError
         If ``q``, ``beta`` or a cut limit is out of range, the tracker is not
         built, the normal form is not computed or has two resonances, or the
@@ -1955,10 +2182,12 @@ def generate_matched_qgaussian_bunch(
         If the cut is too tight for the distribution.
     """
     _check_q_parameters(q, beta)
-    for name, value in (("fact", fact), ("skew_cut", skew_cut)):
+    for name, value in (("fact", fact), ("skew_cut", skew_cut), ("strict_cut", strict_cut)):
         if not isinstance(value, (bool, np.bool_)):
             raise TypeError(f"{name} must be a bool, got {value!r}.")
-    cut = _normalised_cut(sigma_cut_x, sigma_cut_y, bool(skew_cut))
+    cut = None  # the limits are checked by _normalised_cut
+    if _normalised_cut(sigma_cut_x, sigma_cut_y, bool(skew_cut)) is not None:
+        cut = (sigma_cut_x, sigma_cut_y, bool(skew_cut), bool(strict_cut))
     generate = _generate_factorizable if fact else _generate_nonfactorizable
     rng = np.random.default_rng(seed)
     return _matched_bunch(

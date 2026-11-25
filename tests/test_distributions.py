@@ -9,10 +9,12 @@ import pytest
 xt = pytest.importorskip("xtrack")
 
 from xnf4d.distributions import (  # noqa: E402
+    _cuts,
     _f_2D,
     _f_4D,
     _generate_factorizable,
     _generate_nonfactorizable,
+    _normalised_cut,
     _PolyEvaluator,
     _to_complex,
     _to_real,
@@ -558,6 +560,31 @@ class TestQGaussianBunch:
             assert np.any((rx > 2.4) & (ry > 1.6))
         assert rx.max() > 2.8 and ry.max() > 1.8
 
+    @pytest.mark.parametrize("limits", [(3.0, 2.0), (2.0, None), (None, 2.5)])
+    @pytest.mark.parametrize("skew_cut", [True, False])
+    def test_torus_cut_is_normalised_cut_if_linear(self, limits, skew_cut):
+        nf = linear_normal_form()
+        cut, nf_cut = _cuts([nf], [_Transforms(nf, "x")], np.empty(0), *limits, skew_cut, False)
+        assert cut is None
+        w = np.random.default_rng(0).normal(size=(4, 100_000)) * 1.5
+        np.testing.assert_array_equal(nf_cut(w)[0], _normalised_cut(*limits, skew_cut)(w, 1.0))
+
+    @pytest.mark.parametrize("skew_cut", [True, False])
+    def test_cut_tori_stay_within_cut(self, octupole_setup, skew_cut):
+        line, tw = octupole_setup[:2]
+        sx, sy = 5.0, 3.0
+        p, _ = qgaussian(octupole_setup, 2000, q=1.5, beta=0.5, sigma_cut_x=sx,
+                         sigma_cut_y=sy, skew_cut=skew_cut)
+        worst = 0.0
+        for _ in range(200):
+            n = tw.get_normalized_coordinates(p, nemitt_x=NEMITT, nemitt_y=NEMITT)
+            a, b = np.hypot(n.x_norm, n.px_norm) / sx, np.hypot(n.y_norm, n.py_norm) / sy
+            worst = max(worst, float(np.max(np.hypot(a, b) if skew_cut else np.maximum(a, b))))
+            line.track(p, num_turns=1)
+        # whole tori are within the cut, up to the accuracy of the normal form
+        # (the cut of the particles in normalised coordinates leaks ~1% by 1-10%)
+        assert 0.99 < worst < 1.005
+
     def test_cut_in_one_plane(self, linear_setup):
         _, z = qgaussian(linear_setup, 3000, q=2.0, sigma_cut_x=2.0)
         rx, ry = np.hypot(z[0], z[1]), np.hypot(z[2], z[3])
@@ -593,6 +620,7 @@ class TestQGaussianBunch:
             (dict(sigma_cut_y=0.0), ValueError),
             (dict(fact=1), TypeError),
             (dict(skew_cut="yes"), TypeError),
+            (dict(strict_cut=1), TypeError),
         ],
     )
     def test_invalid_arguments(self, linear_setup, kwargs, error):
@@ -640,6 +668,28 @@ class TestResonantNormalForms:
         with pytest.warns(UserWarning, match="approximately matched"):
             self._bunch(linear_setup, generate_matched_qgaussian_bunch, normal_form=nf,
                         q=1.5, beta=1.0, fact=True)
+
+    def test_cut_with_coupling_resonance(self):
+        nf = coupling_normal_form()
+        args = ([nf], [_Transforms(nf, "x")], np.empty(0))
+        w = np.random.default_rng(1).normal(size=(4, 100_000)) * 1.5
+        # elliptical with equal limits: the shell cut, the same as the linear cut
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            cut, nf_cut = _cuts(*args, 2.5, 2.5, True, False)
+        assert cut is None
+        np.testing.assert_array_equal(nf_cut(w)[0], _normalised_cut(2.5, 2.5, True)(w, 1.0))
+        # otherwise the cut in normalised coordinates by default ...
+        for limits, skew in (((3.0, 2.0), True), ((2.5, 2.5), False), ((2.5, None), True)):
+            with pytest.warns(UserWarning, match="normalised coordinates instead"):
+                cut, nf_cut = _cuts(*args, *limits, skew, False)
+            assert nf_cut is None
+            np.testing.assert_array_equal(cut(w, 1.0), _normalised_cut(*limits, skew)(w, 1.0))
+        # ... or the stricter shell cut
+        with pytest.warns(UserWarning, match="removes tori within the cut"):
+            cut, nf_cut = _cuts(*args, 3.0, 2.0, False, True)
+        assert cut is None
+        np.testing.assert_array_equal(nf_cut(w)[0], np.sum(w**2, axis=0) < 4.0)
 
     def test_gaussian_with_other_resonance_warns(self, linear_setup):
         nf = NormalForm4D(linear_normal_form().N, 2, "resonant", res_basis1=[4, 0])
